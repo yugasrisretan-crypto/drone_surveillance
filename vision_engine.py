@@ -998,12 +998,13 @@ class TemporalVoter:
         card_detected: bool,
         card_bbox:     Optional[np.ndarray],
         card_conf:     float,
+        timestamp:     Optional[float] = None,
     ) -> TrackStatus:
         """
         Stage 1: Track ID card detection on chest.
         If card is detected for 3 frames, immediately lock status as ID_CARD_VERIFIED.
         """
-        state = self._states[track_id]
+        state = self._get_or_create(track_id, timestamp or time.time())
 
         # Once verified, it remains locked
         if state.status == TrackStatus.ID_CARD_VERIFIED:
@@ -1047,7 +1048,7 @@ class TemporalVoter:
         Branch 2A: Face matches database (3 frames) -> KNOWN_NO_BADGE (minor warning)
         Branch 2B: Face fails match (6 frames) or evasive 6s -> CONFIRMED_UNKNOWN (Intruder Alert)
         """
-        state = self._states[track_id]
+        state = self._get_or_create(track_id, timestamp)
 
         # Sticky states
         if state.status in (TrackStatus.ID_CARD_VERIFIED, TrackStatus.KNOWN_NO_BADGE, TrackStatus.CONFIRMED_UNKNOWN):
@@ -1505,6 +1506,7 @@ class DroneSurveillanceEngine:
                     card_detected = card_detected,
                     card_bbox     = frame_card_bbox,
                     card_conf     = card_conf,
+                    timestamp     = ts,
                 )
 
                 if card_status == TrackStatus.ID_CARD_VERIFIED or card_detected:
@@ -1569,7 +1571,7 @@ class DroneSurveillanceEngine:
                             "last_processed_ts": ts,
                         }
             except Exception as exc:
-                log.error(f"Biometric worker error on track {tid}: {exc}")
+                log.error(f"Biometric worker error on track {tid}: {exc}", exc_info=True)
             finally:
                 with self._results_lock:
                     self._in_flight.discard(tid)
