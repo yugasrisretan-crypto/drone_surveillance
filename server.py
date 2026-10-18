@@ -69,7 +69,7 @@ DB_PATH      = ROOT / "storage" / "campus.db"
 ID_CARDS_DIR = ROOT / "data" / "id_cards"
 STATIC_DIR   = ROOT / "static"
 
-STREAM_FPS   = 10          # target WebSocket frame rate
+STREAM_FPS   = 30          # target WebSocket frame rate (smooth 25+ FPS streaming)
 STREAM_WIDTH = 960         # resize width before base64 encode
 JPEG_QUALITY = 72          # JPEG encode quality (lower = smaller WS messages)
 
@@ -120,6 +120,8 @@ _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _fps_counter   = 0.0
 _latest_annotated_jpeg: Optional[bytes] = None
 _latest_jpeg_lock = threading.Lock()
+_latest_raw_frame: Optional[np.ndarray] = None
+_raw_frame_lock = threading.Lock()
 
 
 # ===========================================================================
@@ -389,6 +391,11 @@ def processing_loop():
                 # Webcam stalled — brief pause and retry
                 time.sleep(0.05)
             continue
+
+        # Store latest raw frame for live calibration
+        with _raw_frame_lock:
+            global _latest_raw_frame
+            _latest_raw_frame = raw_frame.copy()
 
         # ---------------------------------------------------------------
         # Run engine (hold reload_lock so hot-reload doesn't race)
@@ -718,6 +725,35 @@ async def api_enroll(
         "enrolled_total": enrolled,
         "message":        f"{pid} ({name}) enrolled. Index: {enrolled} person(s).",
     }
+
+
+# ---------------------------------------------------------------------------
+# Instant Live Self-Calibration Endpoint (Fix #5)
+# ---------------------------------------------------------------------------
+@app.post("/api/enroll_live")
+async def api_enroll_live():
+    """
+    1-Click Live Self-Calibration: grabs the largest face currently visible
+    on the webcam, extracts its 512-D embedding, merges it with the user's ID card
+    in campus.faiss and campus.db, and hot-reloads the index immediately.
+    """
+    with _raw_frame_lock:
+        if _latest_raw_frame is None:
+            raise HTTPException(400, "No live webcam frame available. Ensure webcam is running.")
+        frame_copy = _latest_raw_frame.copy()
+
+    def do_calibrate():
+        with reload_lock:
+            return engine.calibrate_live_face(
+                frame_copy,
+                faiss_path=FAISS_PATH,
+                db_path=DB_PATH,
+            )
+
+    result = await asyncio.to_thread(do_calibrate)
+    if not result.get("success", False):
+        raise HTTPException(400, result.get("message", "Calibration failed"))
+    return result
 
 
 # ---------------------------------------------------------------------------

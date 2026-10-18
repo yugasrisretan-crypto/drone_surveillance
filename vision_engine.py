@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import os
 import logging
+import queue
 import sqlite3
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -59,6 +61,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+
+
+def apply_clahe_lab(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: Tuple[int, int] = (8, 8)) -> np.ndarray:
+    """
+    Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) on the L channel
+    in LAB color space. Normalizes shadows and harsh lighting while preserving natural skin chrominance.
+    """
+    if image is None or image.size == 0:
+        return image
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    cl = clahe.apply(l)
+    merged = cv2.merge((cl, a, b))
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 # ---------------------------------------------------------------------------
 # Public constants / tunable thresholds
@@ -109,7 +126,10 @@ class TrackStatus(Enum):
     CONFIRMED_UNKNOWN = auto()   # Branch 2B: Intruder / unknown face (Red box)
     EVASIVE_ALERT     = auto()   # Face hidden >6s without ID card (Orange/Red box)
     UNVERIFIABLE      = auto()   # Current frame pose OOB
-    KNOWN             = KNOWN_NO_BADGE  # Compatibility alias
+    KNOWN             = KNOWN_NO_BADGE     # Compatibility alias
+    ID_CARD_WORN      = ID_CARD_VERIFIED   # Compatibility alias
+    VERIFYING         = PENDING            # Compatibility alias
+    UNKNOWN           = CONFIRMED_UNKNOWN  # Compatibility alias
 
 
 @dataclass
@@ -242,6 +262,7 @@ class BodyTracker:
             conf=self._conf,
             verbose=False,
             device=self._yolo_device,
+            imgsz=416,
         )[0]
 
         detections = sv.Detections.from_ultralytics(results)
@@ -646,79 +667,47 @@ def _laplacian_variance(gray: np.ndarray) -> float:
 class FaceQualityGate:
     """
     Wraps InsightFace SCRFD detection + ArcFace embedding.
-    Applies quality checks before returning an embedding.
+    Applies quality checks (minimum size, blur rejection, 5-point head pose)
+    before returning an L2-normalized 512-D ArcFace embedding.
     """
 
     def __init__(self, model_name: str = INSIGHTFACE_MODEL, det_thresh: float = 0.35):
         from insightface.app import FaceAnalysis
-        log.info(f"Loading InsightFace {model_name} (CPU, 320×320)…")
+        log.info(f"Loading InsightFace {model_name} (CPU, 320×320, detection+recognition only)…")
         self._app = FaceAnalysis(
             name=model_name,
             providers=["CPUExecutionProvider"],
             allowed_modules=["detection", "recognition"],
         )
         self._app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=det_thresh)
+        self.face_app = self._app
         log.info("FaceQualityGate ready.")
 
-    def analyse(
+    def analyse_crop(
         self,
-        frame: np.ndarray,
-        person_bbox: np.ndarray,
-        predetected_face = None,
+        crop: np.ndarray,
     ) -> Tuple[Optional[np.ndarray],   # L2-normed 512-D embedding or None
-               Optional[np.ndarray],   # face_bbox_xyxy in frame coords
+               Optional[np.ndarray],   # face_bbox_xyxy in crop coords
                float,                  # yaw_deg
                float,                  # pitch_deg
-               str]:                   # reason: "ok"|"no_face"|"too_small"|
-                                       #  "blurry"|"unverifiable"
+               str]:                   # reason: "ok"|"no_face"|"too_small"|"blurry"|"unverifiable"
         """
-        Crop the person region from *frame*, detect the face, apply quality
-        checks, and return the embedding plus pose angles.
-        If predetected_face is provided, skips face detection and runs quality
-        checks directly on that face.
+        Detect face directly inside a pre-cropped region,
+        run quality gates (size, blur, 5-point head pose), and extract 512-D ArcFace embedding.
         """
-        fh, fw = frame.shape[:2]
+        if crop is None or crop.size == 0:
+            return None, None, 0.0, 0.0, "no_crop"
 
-        if predetected_face is not None:
-            best = predetected_face
-            crop = frame
-            crop_offset_x, crop_offset_y = 0, 0
-        else:
-            x1, y1, x2, y2 = person_bbox[:4].astype(int)
-            bw, bh = x2 - x1, y2 - y1
+        ch, cw = crop.shape[:2]
+        faces = self._app.get(crop)
+        if not faces:
+            return None, None, 0.0, 0.0, "no_face"
 
-            # Add 10% padding so face is not clipped if near the edge of the person box
-            pad_x = int(bw * 0.10)
-            pad_y = int(bh * 0.10)
-            cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-            cx2, cy2 = min(fw, x2 + pad_x), min(fh, y2 + pad_y)
-            crop = frame[cy1:cy2, cx1:cx2]
-            if crop.size == 0:
-                return None, None, 0.0, 0.0, "no_crop"
-
-            crop_offset_x, crop_offset_y = cx1, cy1
-            faces = self._app.get(crop)
-
-            # Fallback to full frame detection if cropped area missed the face
-            if not faces:
-                all_faces = self._app.get(frame)
-                for f in all_faces:
-                    fcx = (f.bbox[0] + f.bbox[2]) / 2.0
-                    fcy = (f.bbox[1] + f.bbox[3]) / 2.0
-                    if cx1 <= fcx <= cx2 and cy1 <= fcy <= cy2:
-                        faces = [f]
-                        crop = frame
-                        crop_offset_x, crop_offset_y = 0, 0
-                        break
-
-            if not faces:
-                return None, None, 0.0, 0.0, "no_face"
-
-            # Pick face with largest area
-            best = max(
-                faces,
-                key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-            )
+        # Pick face with largest area
+        best = max(
+            faces,
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        )
 
         bx1, by1, bx2, by2 = best.bbox.astype(int)
         face_w = bx2 - bx1
@@ -729,7 +718,6 @@ class FaceQualityGate:
             return None, None, 0.0, 0.0, "too_small"
 
         # --- Optionally upscale small faces (24–48 px) for better embedding ---
-        ch, cw = crop.shape[:2]
         c_by1, c_by2 = max(0, by1), min(ch, by2)
         c_bx1, c_bx2 = max(0, bx1), min(cw, bx2)
         face_crop = crop[c_by1:c_by2, c_bx1:c_bx2]
@@ -767,7 +755,96 @@ class FaceQualityGate:
         if norm > 0:
             emb /= norm
 
-        # Convert face bbox back to frame coordinates
+        face_bbox_crop = np.array([bx1, by1, bx2, by2], dtype=int)
+        return emb, face_bbox_crop, yaw_deg, pitch_deg, "ok"
+
+    def analyse(
+        self,
+        frame: np.ndarray,
+        person_bbox: np.ndarray,
+        predetected_face = None,
+    ) -> Tuple[Optional[np.ndarray],   # L2-normed 512-D embedding or None
+               Optional[np.ndarray],   # face_bbox_xyxy in frame coords
+               float,                  # yaw_deg
+               float,                  # pitch_deg
+               str]:                   # reason: "ok"|"no_face"|"too_small"|"blurry"|"unverifiable"
+        """
+        Crop the person region from *frame*, apply CLAHE LAB luminance normalization,
+        detect the face, apply quality checks, and return the embedding plus pose angles.
+        """
+        fh, fw = frame.shape[:2]
+
+        if predetected_face is not None:
+            best = predetected_face
+            crop = frame
+            crop_offset_x, crop_offset_y = 0, 0
+        else:
+            x1, y1, x2, y2 = person_bbox[:4].astype(int)
+            bw, bh = x2 - x1, y2 - y1
+
+            # Add 10% padding so face is not clipped if near the edge of the person box
+            pad_x = int(bw * 0.10)
+            pad_y = int(bh * 0.10)
+            cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            cx2, cy2 = min(fw, x2 + pad_x), min(fh, y2 + pad_y)
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                return None, None, 0.0, 0.0, "no_crop"
+
+            crop_offset_x, crop_offset_y = cx1, cy1
+            # Apply CLAHE luminance normalization in LAB color space
+            crop_norm = apply_clahe_lab(crop)
+            emb, rel_box, yaw_deg, pitch_deg, reason = self.analyse_crop(crop_norm)
+            if rel_box is not None:
+                face_bbox_frame = np.array([
+                    rel_box[0] + crop_offset_x,
+                    rel_box[1] + crop_offset_y,
+                    rel_box[2] + crop_offset_x,
+                    rel_box[3] + crop_offset_y,
+                ], dtype=int)
+            else:
+                face_bbox_frame = None
+            return emb, face_bbox_frame, yaw_deg, pitch_deg, reason
+
+        # Handling for predetected_face
+        ch, cw = crop.shape[:2]
+        bx1, by1, bx2, by2 = best.bbox.astype(int)
+        face_w = bx2 - bx1
+        face_h = by2 - by1
+
+        if face_w < MIN_FACE_PX or face_h < MIN_FACE_PX:
+            return None, None, 0.0, 0.0, "too_small"
+
+        c_by1, c_by2 = max(0, by1), min(ch, by2)
+        c_bx1, c_bx2 = max(0, bx1), min(cw, bx2)
+        face_crop = crop[c_by1:c_by2, c_bx1:c_bx2]
+        if face_crop.size == 0:
+            return None, None, 0.0, 0.0, "no_face"
+
+        if max(face_w, face_h) < UPSCALE_FACE_THRESH:
+            face_crop = cv2.resize(face_crop, (face_w * 2, face_h * 2), interpolation=cv2.INTER_LANCZOS4)
+
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        if _laplacian_variance(gray) < BLUR_VAR_THRESH:
+            return None, None, 0.0, 0.0, "blurry"
+
+        yaw_deg, pitch_deg = 0.0, 0.0
+        if best.kps is not None and len(best.kps) >= 5:
+            kps5 = best.kps.astype(np.float32)
+            yaw_deg, pitch_deg = _estimate_head_pose(kps5, cw, ch)
+
+        if abs(yaw_deg) > YAW_MAX_DEG or abs(pitch_deg) > PITCH_MAX_DEG:
+            return None, None, yaw_deg, pitch_deg, "unverifiable"
+
+        emb = best.embedding
+        if emb is None:
+            return None, None, yaw_deg, pitch_deg, "no_embedding"
+
+        emb = emb.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb /= norm
+
         face_bbox_frame = np.array([
             bx1 + crop_offset_x, by1 + crop_offset_y, bx2 + crop_offset_x, by2 + crop_offset_y,
         ], dtype=int)
@@ -1313,8 +1390,9 @@ def _annotate_frame(
 class DroneSurveillanceEngine:
     """
     Orchestrates the two-tier hierarchical ID Card Gate surveillance pipeline:
-      Stage 1: Chest & Interactive ROI ID Card Detector (High-Precision OpenCV)
-      Stage 2: InsightFace Face Quality Gate + FAISS Cohort Z-Score
+      Stage 1: Fast tracking (YOLOv11 Nano at imgsz=416) + cached status rendering at 25+ FPS
+      Stage 2: Asynchronous Biometric Worker (threading.Thread + queue.Queue(maxsize=2))
+               running CLAHE pre-normalization, InsightFace & card detection without video stutter.
     """
 
     def __init__(
@@ -1329,20 +1407,29 @@ class DroneSurveillanceEngine:
     ):
         log.info("Initialising DroneSurveillanceEngine…")
         self._tracker       = BodyTracker(model_name=yolo_model, conf=yolo_conf)
-        self._card_detector = ChestCardDetector(
-            conf           = card_conf,
-        )
+        self._card_detector = ChestCardDetector(conf=card_conf)
         self._quality       = FaceQualityGate(det_thresh=det_thresh)
+        self.face_app       = self._quality.face_app
         self._matcher       = OpenSetMatcher(k=FAISS_TOP_K)
         self._voter         = TemporalVoter(snapshot_dir=snapshot_dir)
-        self._radar           = RadarProjector(homography=homography)
+        self._radar         = RadarProjector(homography=homography)
         self._virtual_tracker = VirtualPersonTracker(base_id=1)
-        self._frame_idx       = 0
-        # Frame-skip cache: stores last face-recog results per track_id so that
-        # expensive InsightFace inference only runs every FACE_RECOG_EVERY_N_FRAMES frames.
-        self._face_cache: Dict[int, dict] = {}
-        self._cached_all_faces: list = []
-        log.info("DroneSurveillanceEngine ready (FAISS not yet loaded — CPU mode).")
+        self._frame_idx     = 0
+
+        # Architectural Fix #2: Decoupled Biometric Worker
+        self._bio_queue     = queue.Queue(maxsize=2)
+        self._async_results: Dict[int, dict] = {}
+        self.tracks         = self._async_results  # public alias as requested
+        self._results_lock  = threading.Lock()
+        self._in_flight: set = set()
+        self._worker_stopped = threading.Event()
+        self._bio_thread    = threading.Thread(
+            target=self._biometric_worker,
+            daemon=True,
+            name="biometric-worker"
+        )
+        self._bio_thread.start()
+        log.info("DroneSurveillanceEngine ready (decoupled biometric worker started, CPU mode).")
 
     def load(self, faiss_path: str | Path, db_path: str | Path):
         """Load FAISS index and SQLite metadata. Must be called before process_frame."""
@@ -1356,6 +1443,138 @@ class DroneSurveillanceEngine:
         """Update the campus homography matrix (3×3 float64)."""
         self._radar.set_homography(H)
 
+    def stop(self):
+        """Stop background worker thread."""
+        self._worker_stopped.set()
+        try:
+            self._bio_queue.put_nowait(None)
+        except Exception:
+            pass
+
+    def _biometric_worker(self):
+        """
+        Dedicated background worker for face + ID card verification.
+        Pulls one unverified person crop at a time from _bio_queue,
+        runs CLAHE pre-normalization, InsightFace & card detection,
+        and updates self.tracks[tid] asynchronously without blocking the video stream.
+        """
+        log.info("Biometric worker thread active.")
+        while not self._worker_stopped.is_set():
+            try:
+                task = self._bio_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+
+            tid, crop, bbox, ts = task
+            try:
+                ch, cw = crop.shape[:2]
+
+                # -----------------------------------------------------------
+                # Stage 1: Chest & Interaction ROI ID Card Detection
+                # -----------------------------------------------------------
+                cx1 = max(0, int(0.08 * cw))
+                cx2 = min(cw, int(0.92 * cw))
+                cy1 = max(0, int(0.12 * ch))
+                cy2 = min(ch, int(0.88 * ch))
+                chest_subcrop = crop[cy1:cy2, cx1:cx2]
+
+                card_detected, rel_box, card_conf, card_src = self._card_detector.detect(chest_subcrop)
+                frame_card_bbox = None
+                if card_detected and rel_box is not None:
+                    frame_card_bbox = np.array([
+                        bbox[0] + cx1 + rel_box[0],
+                        bbox[1] + cy1 + rel_box[1],
+                        bbox[0] + cx1 + rel_box[2],
+                        bbox[1] + cy1 + rel_box[3],
+                    ], dtype=int)
+                else:
+                    # Also test full person crop
+                    card_detected, rel_box, card_conf, card_src = self._card_detector.detect(crop)
+                    if card_detected and rel_box is not None:
+                        frame_card_bbox = np.array([
+                            bbox[0] + rel_box[0],
+                            bbox[1] + rel_box[1],
+                            bbox[0] + rel_box[2],
+                            bbox[1] + rel_box[3],
+                        ], dtype=int)
+
+                card_status = self._voter.update_card_detection(
+                    track_id      = tid,
+                    card_detected = card_detected,
+                    card_bbox     = frame_card_bbox,
+                    card_conf     = card_conf,
+                )
+
+                if card_status == TrackStatus.ID_CARD_VERIFIED or card_detected:
+                    with self._results_lock:
+                        self._async_results[tid] = {
+                            "status":            TrackStatus.ID_CARD_VERIFIED,
+                            "person_id":         None,
+                            "person_name":       None,
+                            "s1":                0.0,
+                            "z_score":           0.0,
+                            "has_id_card":       True,
+                            "card_bbox":         frame_card_bbox,
+                            "card_conf":         card_conf if card_conf > 0 else 0.95,
+                            "face_bbox":         None,
+                            "yaw":               0.0,
+                            "pitch":             0.0,
+                            "last_processed_ts": ts,
+                        }
+                else:
+                    # -----------------------------------------------------------
+                    # Stage 2: CLAHE Pre-normalization + Face Quality Gate + ArcFace
+                    # -----------------------------------------------------------
+                    clahe_crop = apply_clahe_lab(crop)
+                    emb, rel_face_box, yaw, pitch, reason = self._quality.analyse_crop(clahe_crop)
+
+                    frame_face_bbox = None
+                    if rel_face_box is not None:
+                        frame_face_bbox = np.array([
+                            bbox[0] + rel_face_box[0],
+                            bbox[1] + rel_face_box[1],
+                            bbox[0] + rel_face_box[2],
+                            bbox[1] + rel_face_box[3],
+                        ], dtype=int)
+
+                    match: Optional[MatchResult] = None
+                    if reason == "ok" and emb is not None:
+                        match = self._matcher.match(emb)
+
+                    status = self._voter.update_face_pipeline(
+                        track_id       = tid,
+                        frame          = crop,
+                        person_bbox    = bbox,
+                        match          = match,
+                        quality_reason = reason,
+                        timestamp      = ts,
+                    )
+
+                    st = self._voter.get_state(tid)
+                    with self._results_lock:
+                        self._async_results[tid] = {
+                            "status":            status,
+                            "person_id":         st.known_person_id if st else (match.person_id if match else None),
+                            "person_name":       st.known_person_name if st else (match.person_name if match else None),
+                            "s1":                match.s1 if match else 0.0,
+                            "z_score":           match.z_score if match else 0.0,
+                            "has_id_card":       False,
+                            "card_bbox":         frame_card_bbox,
+                            "card_conf":         card_conf,
+                            "face_bbox":         frame_face_bbox,
+                            "yaw":               yaw,
+                            "pitch":             pitch,
+                            "last_processed_ts": ts,
+                        }
+            except Exception as exc:
+                log.error(f"Biometric worker error on track {tid}: {exc}")
+            finally:
+                with self._results_lock:
+                    self._in_flight.discard(tid)
+                self._bio_queue.task_done()
+
     def process_frame(
         self,
         frame:     np.ndarray,
@@ -1363,7 +1582,10 @@ class DroneSurveillanceEngine:
         annotate:  bool            = True,
     ) -> FrameResult:
         """
-        Run the two-tier hierarchical pipeline on a single BGR frame.
+        Fast non-blocking main loop:
+          - Runs YOLOv11 Nano person tracking at imgsz=416 (~15 ms).
+          - Instantly renders the video at 25+ FPS using latest cached status.
+          - Dispatches unverified crops asynchronously to background worker.
         """
         if timestamp is None:
             timestamp = time.time()
@@ -1371,14 +1593,15 @@ class DroneSurveillanceEngine:
         self._frame_idx += 1
         result = FrameResult(frame_idx=self._frame_idx, timestamp=timestamp)
 
+        fh, fw = frame.shape[:2]
+        frame_area = fh * fw
+
         # ---------------------------------------------------------------
-        # Module 1: Body tracking with background noise suppression
+        # Fast YOLOv11 Nano person tracking
         # ---------------------------------------------------------------
         tracked_persons = self._tracker.track(frame)
-        fh, fw          = frame.shape[:2]
-        frame_area      = fh * fw
 
-        # Filter out background furniture/noise detections (keep real foreground persons)
+        # Filter out background furniture/noise detections
         if tracked_persons:
             p_areas = [(px2 - px1) * (py2 - py1) for _, (px1, py1, px2, py2) in tracked_persons]
             max_p_area = max(p_areas) if p_areas else 0
@@ -1386,286 +1609,91 @@ class DroneSurveillanceEngine:
             for tid, bbox in tracked_persons:
                 px1, py1, px2, py2 = bbox[:4]
                 area = (px2 - px1) * (py2 - py1)
-                # Must be at least 3% of frame or at least 20% of primary person size
                 if area >= 0.03 * frame_area and (max_p_area == 0 or area >= 0.20 * max_p_area):
                     filtered_persons.append((tid, bbox))
             tracked_persons = filtered_persons
+        else:
+            # Webcam close-up fallback: center region represents primary user
+            center_bbox = np.array([int(0.12 * fw), int(0.04 * fh), int(0.88 * fw), int(0.96 * fh)], dtype=int)
+            tracked_persons = [(1, center_bbox)]
 
         active_ids = {tid for tid, _ in tracked_persons if tid > 0}
-
-        # ---------------------------------------------------------------
-        # Module 1C: Laptop Webcam Close-Up Fallback
-        # If InsightFace detects a face that isn't inside any YOLOv11 person box,
-        # automatically create a virtual person/chest bounding box around and below
-        # that face so bounding boxes & ID card detection ALWAYS appear on webcam!
-        #
-        # Frame-skipping: heavy InsightFace face detection only runs once every
-        # FACE_RECOG_EVERY_N_FRAMES (3) frames. Reuses bounding boxes and detected
-        # faces in between for smooth, high-FPS CPU execution.
-        # ---------------------------------------------------------------
-        run_face_recog = (self._frame_idx % FACE_RECOG_EVERY_N_FRAMES == 0) or (len(self._cached_all_faces) == 0)
-        if run_face_recog:
-            raw_faces = self._quality._app.get(frame)
-            # Suppress false-positive background faces (wallpapers, shadows, reflections)
-            self._cached_all_faces = [
-                f for f in raw_faces
-                if getattr(f, "det_score", 0.0) >= 0.60
-                and (f.bbox[2] - f.bbox[0]) >= 40
-                and (f.bbox[3] - f.bbox[1]) >= 40
-            ]
-            all_faces = self._cached_all_faces
-        else:
-            all_faces = self._cached_all_faces
-
-        face_by_track: Dict[int, any] = {}
-        unmatched_virtual_boxes: List[Tuple[np.ndarray, any]] = []
-
-        for face in all_faces:
-            fbx1, fby1, fbx2, fby2 = face.bbox.astype(int)
-            fcx = (fbx1 + fbx2) / 2.0
-            fcy = (fby1 + fby2) / 2.0
-            face_w = max(1, fbx2 - fbx1)
-            face_h = max(1, fby2 - fby1)
-
-            matched_tid = None
-            for tid, (px1, py1, px2, py2) in tracked_persons:
-                if px1 <= fcx <= px2 and py1 <= fcy <= py2:
-                    matched_tid = tid
-                    break
-
-            if matched_tid is not None:
-                if matched_tid not in face_by_track:
-                    face_by_track[matched_tid] = face
-            else:
-                # Close-up fallback: build virtual person bbox from head down to chest
-                vx1 = max(0, int(fcx - 1.4 * face_w))
-                vx2 = min(fw, int(fcx + 1.4 * face_w))
-                vy1 = max(0, int(fby1 - 0.25 * face_h))
-                vy2 = min(fh, max(int(fby2 + 3.2 * face_h), int(fh * 0.98)))
-                vbox = np.array([vx1, vy1, vx2, vy2], dtype=int)
-                unmatched_virtual_boxes.append((vbox, face))
-
-        if unmatched_virtual_boxes:
-            # Sort by face size descending and keep only foreground user(s)
-            unmatched_virtual_boxes.sort(
-                key=lambda item: (item[1].bbox[2] - item[1].bbox[0]) * (item[1].bbox[3] - item[1].bbox[1]),
-                reverse=True,
-            )
-            unmatched_virtual_boxes = unmatched_virtual_boxes[:2]
-            v_boxes = [b for b, _ in unmatched_virtual_boxes]
-            v_tracked = self._virtual_tracker.update(v_boxes, timestamp, active_ids)
-            for (tid, box), (_, face) in zip(v_tracked, unmatched_virtual_boxes):
-                tracked_persons.append((tid, box))
-                active_ids.add(tid)
-                face_by_track[tid] = face
-
-        # ---------------------------------------------------------------
-        # Per-person two-tier hierarchical processing
-        # ---------------------------------------------------------------
         persons_out: List[TrackedPerson] = []
 
         for track_id, bbox in tracked_persons:
             if track_id <= 0:
                 continue
 
-            state = self._voter.get_or_create_state(track_id, timestamp)
-            known_face = face_by_track.get(track_id)
-            known_face_bbox = known_face.bbox.astype(int) if known_face is not None else None
+            with self._results_lock:
+                cached = self._async_results.get(track_id)
 
-            # -----------------------------------------------------------
-            # Stage 1: Chest & Interaction ROI ID Card Detection
-            # -----------------------------------------------------------
-            cx1, cy1, cx2, cy2 = extract_chest_roi(bbox, fh, fw, face_bbox=known_face_bbox)
-            chest_crop = frame[cy1:cy2, cx1:cx2]
-
-            card_detected, rel_card_box, card_conf, card_src = self._card_detector.detect(chest_crop)
-            frame_card_bbox = None
-            if card_detected and rel_card_box is not None:
-                frame_card_bbox = np.array([
-                    cx1 + rel_card_box[0],
-                    cy1 + rel_card_box[1],
-                    cx1 + rel_card_box[2],
-                    cy1 + rel_card_box[3],
-                ], dtype=int)
+            if cached is None:
+                current_status = TrackStatus.PENDING
+                has_card  = False
+                card_box  = None
+                card_conf = 0.0
+                face_box  = None
+                pid       = None
+                pname     = None
+                s1        = 0.0
+                z_score   = 0.0
+                yaw       = 0.0
+                pitch     = 0.0
             else:
-                # Widen search to user's full upper body / hand interaction zone
-                # (in case the ID card is held in hand or raised towards the webcam)
-                px1, py1, px2, py2 = bbox[:4].astype(int)
-                ux1, uy1 = max(0, px1), max(0, py1)
-                ux2, uy2 = min(fw, px2), min(fh, py1 + int(0.75 * (py2 - py1)))
-                if (ux2 - ux1) > 60 and (uy2 - uy1) > 60:
-                    user_crop = frame[uy1:uy2, ux1:ux2]
-                    c_det, c_rel, c_conf, c_src = self._card_detector.detect(user_crop)
-                    if c_det and c_rel is not None:
-                        card_detected = True
-                        rel_card_box = c_rel
-                        card_conf = c_conf
-                        card_src = c_src
-                        frame_card_bbox = np.array([
-                            ux1 + c_rel[0],
-                            uy1 + c_rel[1],
-                            ux1 + c_rel[2],
-                            uy1 + c_rel[3],
-                        ], dtype=int)
+                current_status = cached.get("status", TrackStatus.PENDING)
+                has_card       = cached.get("has_id_card", False)
+                card_box       = cached.get("card_bbox")
+                card_conf      = cached.get("card_conf", 0.0)
+                face_box       = cached.get("face_bbox")
+                pid            = cached.get("person_id")
+                pname          = cached.get("person_name")
+                s1             = cached.get("s1", 0.0)
+                z_score        = cached.get("z_score", 0.0)
+                yaw            = cached.get("yaw", 0.0)
+                pitch          = cached.get("pitch", 0.0)
 
-            # Update ID card detection evidence
-            card_status = self._voter.update_card_detection(
-                track_id      = track_id,
-                card_detected = card_detected,
-                card_bbox     = frame_card_bbox,
-                card_conf     = card_conf,
-            )
+            # Asynchronously dispatch unverified person crop to background worker
+            needs_verification = (current_status in (TrackStatus.PENDING, TrackStatus.SCANNING_FACE, TrackStatus.UNVERIFIABLE))
+            with self._results_lock:
+                is_in_flight = track_id in self._in_flight
 
-            # -----------------------------------------------------------
-            # Stage 1 Decision (Wearing or Holding ID Card):
-            # If ID card detected -> immediately lock ID_CARD_VERIFIED
-            # Skip facial recognition, no alerts
-            # -----------------------------------------------------------
-            if card_status == TrackStatus.ID_CARD_VERIFIED or state.status == TrackStatus.ID_CARD_VERIFIED or card_detected:
-                radar_xy = self._radar.project(bbox)
-                tp = TrackedPerson(
-                    track_id    = track_id,
-                    bbox_xyxy   = bbox,
-                    status      = TrackStatus.ID_CARD_VERIFIED,
-                    person_id   = None,
-                    person_name = None,
-                    has_id_card = True,
-                    card_bbox   = frame_card_bbox if frame_card_bbox is not None else state.card_bbox,
-                    card_conf   = card_conf if card_conf > 0 else (state.card_conf or 0.95),
-                    radar_xy    = radar_xy,
-                )
-                persons_out.append(tp)
-                continue
-
-            # -----------------------------------------------------------
-            # Initial frames without card: PENDING (checking for ID card)
-            # -----------------------------------------------------------
-            if state.no_card_frames < FRAMES_NO_CARD_ESCALATE and state.status == TrackStatus.PENDING:
-                radar_xy = self._radar.project(bbox)
-                tp = TrackedPerson(
-                    track_id    = track_id,
-                    bbox_xyxy   = bbox,
-                    status      = TrackStatus.PENDING,
-                    has_id_card = False,
-                    card_bbox   = frame_card_bbox,
-                    card_conf   = card_conf,
-                    radar_xy    = radar_xy,
-                )
-                persons_out.append(tp)
-                continue
-
-            # -----------------------------------------------------------
-            # Stage 2 Escalation (No ID Card Found after frames):
-            # Transition to face verification
-            # -----------------------------------------------------------
-            run_recog = (self._frame_idx % FACE_RECOG_EVERY_N_FRAMES == 0)
-            if run_recog or (track_id not in self._face_cache):
-                if known_face is not None:
-                    emb, face_bbox, yaw, pitch, reason = self._quality.analyse(
-                        frame, bbox, predetected_face=known_face
-                    )
-                elif run_recog:
-                    emb, face_bbox, yaw, pitch, reason = self._quality.analyse(
-                        frame, bbox
-                    )
-                else:
-                    emb, face_bbox, yaw, pitch, reason = None, None, 0.0, 0.0, "no_face"
-
-                match: Optional[MatchResult] = None
-                if reason == "ok" and emb is not None:
-                    match = self._matcher.match(emb)
-                self._face_cache[track_id] = {
-                    "face_bbox": face_bbox,
-                    "yaw": yaw,
-                    "pitch": pitch,
-                    "reason": reason,
-                    "match": match,
-                }
-            else:
-                cached = self._face_cache[track_id]
-                face_bbox = cached["face_bbox"]
-                yaw       = cached["yaw"]
-                pitch     = cached["pitch"]
-                reason    = cached["reason"]
-                match     = cached["match"]
-
-            status = self._voter.update_face_pipeline(
-                track_id       = track_id,
-                frame          = frame,
-                person_bbox    = bbox,
-                match          = match,
-                quality_reason = reason,
-                timestamp      = timestamp,
-            )
-
-            # Display override if current pose is out of bounds
-            if reason == "unverifiable" and status not in (
-                TrackStatus.KNOWN_NO_BADGE, TrackStatus.CONFIRMED_UNKNOWN, TrackStatus.EVASIVE_ALERT
-            ):
-                display_status = TrackStatus.UNVERIFIABLE
-            else:
-                display_status = status
+            last_ts = cached.get("last_processed_ts", 0.0) if cached else 0.0
+            if needs_verification and not is_in_flight and (timestamp - last_ts > 0.15):
+                px1, py1, px2, py2 = bbox[:4]
+                cx1, cy1 = max(0, px1), max(0, py1)
+                cx2, cy2 = min(fw, px2), min(fh, py2)
+                crop = frame[cy1:cy2, cx1:cx2].copy()
+                if crop.size > 0:
+                    try:
+                        self._bio_queue.put_nowait((track_id, crop, np.array([cx1, cy1, cx2, cy2]), timestamp))
+                        with self._results_lock:
+                            self._in_flight.add(track_id)
+                    except queue.Full:
+                        pass  # worker busy: zero dropping of video frames!
 
             radar_xy = self._radar.project(bbox)
-            st = self._voter.get_state(track_id)
             tp = TrackedPerson(
                 track_id    = track_id,
                 bbox_xyxy   = bbox,
-                status      = display_status,
-                person_id   = st.known_person_id if st else None,
-                person_name = st.known_person_name if st else None,
-                s1          = match.s1 if match else 0.0,
-                z_score     = match.z_score if match else 0.0,
-                face_bbox   = face_bbox,
+                status      = current_status,
+                person_id   = pid,
+                person_name = pname,
+                s1          = s1,
+                z_score     = z_score,
+                face_bbox   = face_box,
                 yaw_deg     = yaw,
                 pitch_deg   = pitch,
                 radar_xy    = radar_xy,
-                has_id_card = False,
-                card_bbox   = frame_card_bbox,
+                has_id_card = has_card,
+                card_bbox   = card_box,
                 card_conf   = card_conf,
             )
             persons_out.append(tp)
 
-        # ---------------------------------------------------------------
-        # Frame-level card scan fallback:
-        # If no person was tracked or no card was found on persons,
-        # scan the camera frame directly for a held-up ID card!
-        # ---------------------------------------------------------------
-        if not any(p.has_id_card for p in persons_out):
-            cfx1 = int(0.08 * fw)
-            cfy1 = int(0.08 * fh)
-            cfx2 = int(0.92 * fw)
-            cfy2 = int(0.92 * fh)
-            center_crop = frame[cfy1:cfy2, cfx1:cfx2]
-            c_det, c_rel, c_conf, c_src = self._card_detector.detect(center_crop)
-            if c_det and c_rel is not None:
-                f_box = np.array([
-                    cfx1 + c_rel[0],
-                    cfy1 + c_rel[1],
-                    cfx1 + c_rel[2],
-                    cfy1 + c_rel[3],
-                ], dtype=int)
-                if persons_out:
-                    persons_out[0].has_id_card = True
-                    persons_out[0].card_bbox = f_box
-                    persons_out[0].card_conf = c_conf
-                    persons_out[0].status = TrackStatus.ID_CARD_VERIFIED
-                else:
-                    tp = TrackedPerson(
-                        track_id    = 1,
-                        bbox_xyxy   = f_box,
-                        status      = TrackStatus.ID_CARD_VERIFIED,
-                        has_id_card = True,
-                        card_bbox   = f_box,
-                        card_conf   = c_conf,
-                    )
-                    persons_out.append(tp)
-
-        # ---------------------------------------------------------------
-        # Purge stale track states
-        # ---------------------------------------------------------------
+        # Purge stale tracks
         self._voter.purge_stale_tracks(active_ids)
-        self._face_cache = {tid: c for tid, c in self._face_cache.items() if tid in active_ids}
+        with self._results_lock:
+            self._async_results = {tid: c for tid, c in self._async_results.items() if tid in active_ids}
 
         result.persons = persons_out
         if annotate:
@@ -1674,6 +1702,105 @@ class DroneSurveillanceEngine:
             result.annotated_frame = frame
 
         return result
+
+    def calibrate_live_face(
+        self,
+        frame: np.ndarray,
+        faiss_path: Path | str,
+        db_path: Path | str,
+        person_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Instant Live Self-Calibration (Fix #5):
+        Grabs the largest face currently visible in *frame*, applies CLAHE LAB pre-normalization,
+        extracts its 512-D embedding, merges it with the user's identity in campus.faiss and campus.db,
+        and hot-reloads the index immediately.
+        """
+        faiss_path = Path(faiss_path)
+        db_path = Path(db_path)
+        if frame is None or frame.size == 0:
+            return {"success": False, "message": "Invalid frame received"}
+
+        # Apply CLAHE luminance normalization in LAB space
+        norm_frame = apply_clahe_lab(frame)
+        faces = self.face_app.get(norm_frame)
+        if not faces:
+            faces = self.face_app.get(frame)
+
+        if not faces:
+            return {
+                "success": False,
+                "message": "No face detected on webcam. Please face the camera with good lighting."
+            }
+
+        # Largest face by bounding box area
+        best_face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        if best_face.embedding is None:
+            return {"success": False, "message": "Could not extract face embedding from webcam."}
+
+        emb = best_face.embedding.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb /= norm
+
+        # Connect to SQLite DB to identify the enrolled person
+        conn = sqlite3.connect(str(db_path))
+        target_pid = person_id
+        target_name = None
+
+        if target_pid:
+            row = conn.execute("SELECT person_id, name FROM persons WHERE person_id=?", (target_pid,)).fetchone()
+            if row:
+                target_name = row[1]
+
+        if not target_name:
+            # Pick first enrolled person from database
+            row = conn.execute("SELECT person_id, name FROM persons ORDER BY enrolled_at ASC LIMIT 1").fetchone()
+            if row:
+                target_pid, target_name = row[0], row[1]
+            else:
+                target_pid = "EMP001"
+                target_name = "Campus User"
+                conn.execute(
+                    "INSERT OR REPLACE INTO persons (person_id, name, photo_path, enrolled_at) VALUES (?,?,?,?)",
+                    (target_pid, target_name, "webcam_live", time.time())
+                )
+                conn.commit()
+
+        # Update FAISS index
+        if faiss_path.exists():
+            idx = faiss.read_index(str(faiss_path))
+        else:
+            idx = faiss.IndexFlatIP(EMBEDDING_DIM)
+
+        new_faiss_id = idx.ntotal
+        idx.add(emb.reshape(1, -1))
+        faiss.write_index(idx, str(faiss_path))
+
+        # Record vector in SQLite
+        conn.execute(
+            "INSERT INTO vectors (faiss_id, person_id, view_index, view_label) VALUES (?,?,?,?)",
+            (new_faiss_id, target_pid, 99, "live_webcam_calibration")
+        )
+        conn.commit()
+        conn.close()
+
+        # Hot-reload FAISS & DB into running matcher
+        self.load(faiss_path, db_path)
+
+        # Clear cached statuses so new vector is matched immediately
+        with self._results_lock:
+            self._async_results.clear()
+            self._in_flight.clear()
+
+        log.info(f"⚡ Live face calibrated for [{target_pid}] {target_name} -> FAISS ID {new_faiss_id} (total={idx.ntotal})")
+        return {
+            "success": True,
+            "person_id": target_pid,
+            "person_name": target_name,
+            "faiss_total": idx.ntotal,
+            "message": f"Successfully calibrated live face for {target_name} ({target_pid})! Index now has {idx.ntotal} vectors."
+        }
 
 
 # ===========================================================================

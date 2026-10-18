@@ -160,6 +160,30 @@
     }
     .enroll-hdr-btn:hover { background: #0a84ff28; }
 
+    .calibrate-hdr-btn {
+      padding: 6px 14px;
+      background: rgba(0, 230, 118, 0.12);
+      border: 1px solid var(--known);
+      border-radius: 5px;
+      color: var(--known);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .calibrate-hdr-btn:hover {
+      background: rgba(0, 230, 118, 0.22);
+      box-shadow: 0 0 10px rgba(0, 230, 118, 0.35);
+    }
+    .calibrate-hdr-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     /* Source toggle pill */
     .source-toggle {
       display: flex;
@@ -805,6 +829,7 @@
   </div>
 
   <div class="divider"></div>
+  <button class="calibrate-hdr-btn" id="btn-calibrate-live" onclick="calibrateLiveFace()" title="Instant Live Self-Calibration from Webcam">⚡ 1-Click Calibrate Face from Webcam</button>
   <button class="enroll-hdr-btn" onclick="openEnroll()">⊕ Enroll ID Card</button>
 </header>
 
@@ -1474,6 +1499,34 @@ async function submitEnroll() {
     msg.textContent = '✗ Network error — check server.';
     btn.disabled    = false;
     btn.textContent = 'Enroll';
+  }
+}
+
+// =========================================================================
+// 1-Click Live Self-Calibration from Webcam (Fix #5)
+// =========================================================================
+async function calibrateLiveFace() {
+  const btn = document.getElementById('btn-calibrate-live');
+  btn.disabled = true;
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '⏳ Calibrating…';
+  try {
+    const resp = await fetch('/api/enroll_live', { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok && data.success) {
+      alert(`✅ ${data.message}`);
+      if (data.faiss_total) {
+        const ev = document.getElementById('enrolled-v');
+        if (ev) ev.textContent = data.faiss_total;
+      }
+    } else {
+      alert(`⚠️ Calibration notice: ${data.detail || data.message || 'No face detected on webcam'}`);
+    }
+  } catch (err) {
+    alert('❌ Network error during calibration. Check server.');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
   }
 }
 

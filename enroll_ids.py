@@ -59,119 +59,67 @@ log = logging.getLogger("enroll_ids")
 EMBEDDING_DIM = 512          # ArcFace output dimensionality
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Synthetic view parameters: (pitch_deg, yaw_deg)
-# pitch > 0  = downward tilt (drone looking down)
-# yaw   != 0 = left/right rotation
-SYNTHETIC_VIEWS: list[tuple[float, float]] = [
-    (20.0,   0.0),   # mild downward
-    (35.0,   0.0),   # moderate downward
-    (45.0,   0.0),   # steep downward
-    (20.0,  20.0),   # mild down + right yaw
-    (20.0, -20.0),   # mild down + left yaw
-    (35.0,  20.0),   # moderate down + right yaw
-    # Note: original (0°,0°) is always included as view 0, total = 7
-]
-
-
-# ---------------------------------------------------------------------------
-# CLAHE contrast normalisation
-# ---------------------------------------------------------------------------
-def apply_clahe(bgr: np.ndarray) -> np.ndarray:
-    """Apply CLAHE to the L channel of LAB colour space."""
+def apply_clahe(bgr: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8)) -> np.ndarray:
+    """
+    Apply CLAHE luminance normalization in LAB color space to equalize shadows
+    and harsh lighting while preserving natural skin chrominance.
+    """
+    if bgr is None or bgr.size == 0:
+        return bgr
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l_ch, a_ch, b_ch = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_eq = clahe.apply(l_ch)
-    merged = cv2.merge([l_eq, a_ch, b_ch])
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    cl = clahe.apply(l)
+    merged = cv2.merge((cl, a, b))
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 
-# ---------------------------------------------------------------------------
-# Perspective warp — simulate drone viewing angle
-# ---------------------------------------------------------------------------
-def perspective_warp(
-    img: np.ndarray,
-    pitch_deg: float,
-    yaw_deg: float,
-) -> np.ndarray:
+def generate_photometric_views(bgr: np.ndarray) -> list[tuple[np.ndarray, int, str]]:
     """
-    Generate a synthetic perspective-warped view of *img* that approximates
-    a drone looking at a person's face from above (pitch) and to one side (yaw).
-
-    The transform is computed analytically from the camera projection model:
-    a rotation matrix R = Ry(yaw) · Rx(pitch) is used to derive where the
-    four image corners map to in the virtual camera plane, then cv2.getPerspectiveTransform
-    is applied to warp the source image.
-
-    Args:
-        img:       Input BGR image (any size).
-        pitch_deg: Downward tilt angle in degrees (0 = frontal, 90 = top-down).
-        yaw_deg:   Left/right rotation angle in degrees (positive = right).
-
-    Returns:
-        Warped BGR image with the same spatial dimensions as *img*.
+    Generate 7 clean photometric and mild-tilt variations:
+      1. Original ID card crop
+      2. CLAHE shadow-normalized (LAB color space)
+      3. Gamma bright (gamma=0.74, expands shadow details)
+      4. Gamma dark (gamma=1.35, enhances highlight definition)
+      5. Horizontal flip (bilateral facial symmetry)
+      6. +8 deg mild affine rotation
+      7. -8 deg mild affine rotation
     """
-    h, w = img.shape[:2]
+    h, w = bgr.shape[:2]
     cx, cy = w / 2.0, h / 2.0
 
-    # Focal length heuristic: use image diagonal / 2
-    f = np.sqrt(w ** 2 + h ** 2) / 2.0
+    views: list[tuple[np.ndarray, int, str]] = []
 
-    # Convert angles to radians
-    pitch = np.radians(pitch_deg)
-    yaw   = np.radians(yaw_deg)
+    # 1. Original
+    views.append((bgr.copy(), 1, "original"))
 
-    # Rotation matrices
-    Rx = np.array([
-        [1,           0,            0],
-        [0,  np.cos(pitch), -np.sin(pitch)],
-        [0,  np.sin(pitch),  np.cos(pitch)],
-    ])
-    Ry = np.array([
-        [ np.cos(yaw), 0, np.sin(yaw)],
-        [           0, 1,           0],
-        [-np.sin(yaw), 0, np.cos(yaw)],
-    ])
-    R = Ry @ Rx  # combined rotation
+    # 2. CLAHE shadow-normalized
+    views.append((apply_clahe(bgr), 2, "clahe_shadow_normalized"))
 
-    # Camera intrinsics (principal point at image centre)
-    K = np.array([
-        [f, 0, cx],
-        [0, f, cy],
-        [0, 0,  1],
-    ])
+    # 3. Gamma bright (gamma ~ 0.74)
+    inv_gamma_bright = 1.0 / 1.35
+    lut_bright = np.array([((i / 255.0) ** inv_gamma_bright) * 255 for i in range(256)]).astype("uint8")
+    views.append((cv2.LUT(bgr, lut_bright), 3, "gamma_bright"))
 
-    # Source corners in image coords
-    src_corners = np.float32([
-        [0,     0    ],
-        [w - 1, 0    ],
-        [w - 1, h - 1],
-        [0,     h - 1],
-    ])
+    # 4. Gamma dark (gamma = 1.35)
+    inv_gamma_dark = 1.35
+    lut_dark = np.array([((i / 255.0) ** inv_gamma_dark) * 255 for i in range(256)]).astype("uint8")
+    views.append((cv2.LUT(bgr, lut_dark), 4, "gamma_dark"))
 
-    # Lift src corners to normalised 3-D plane (Z=1)
-    dst_pts = []
-    for (px, py) in src_corners:
-        # Unproject to camera ray
-        p_cam = np.array([(px - cx) / f, (py - cy) / f, 1.0])
-        p_rot = R @ p_cam          # rotate
-        if p_rot[2] == 0:
-            p_rot[2] = 1e-6
-        # Re-project onto image plane
-        p_img = K @ p_rot
-        p_img /= p_img[2]
-        dst_pts.append([p_img[0], p_img[1]])
+    # 5. Horizontal flip
+    views.append((cv2.flip(bgr, 1), 5, "horizontal_flip"))
 
-    dst_corners = np.float32(dst_pts)
+    # 6. +8 deg affine rotation
+    M_p8 = cv2.getRotationMatrix2D((cx, cy), 8.0, 1.0)
+    rot_p8 = cv2.warpAffine(bgr, M_p8, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+    views.append((rot_p8, 6, "rot_plus_8deg"))
 
-    # Clamp destination points so the transform is valid
-    dst_corners[:, 0] = np.clip(dst_corners[:, 0], -w, 2 * w)
-    dst_corners[:, 1] = np.clip(dst_corners[:, 1], -h, 2 * h)
+    # 7. -8 deg affine rotation
+    M_m8 = cv2.getRotationMatrix2D((cx, cy), -8.0, 1.0)
+    rot_m8 = cv2.warpAffine(bgr, M_m8, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+    views.append((rot_m8, 7, "rot_minus_8deg"))
 
-    M = cv2.getPerspectiveTransform(src_corners, dst_corners)
-    warped = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_REPLICATE)
-    return warped
+    return views
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +129,7 @@ _face_app = None
 
 
 def get_face_app(det_thresh: float = 0.3) -> object:
-    """Load and cache the InsightFace FaceAnalysis model."""
+    """Load and cache the InsightFace FaceAnalysis model (CPU, 640x640, detection+recognition only)."""
     global _face_app
     if _face_app is None:
         try:
@@ -191,13 +139,13 @@ def get_face_app(det_thresh: float = 0.3) -> object:
             log.error("insightface is not installed. Run: pip install insightface")
             sys.exit(1)
 
-        log.info("Loading InsightFace buffalo_l model (CPU, 320×320)…")
+        log.info("Loading InsightFace buffalo_l model (CPU, 640×640, detection+recognition only)…")
         app = FaceAnalysis(
             name="buffalo_l",
             providers=["CPUExecutionProvider"],
             allowed_modules=["detection", "recognition"],
         )
-        app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=det_thresh)
+        app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=det_thresh)
         _face_app = app
         log.info("InsightFace model loaded.")
     return _face_app
@@ -378,18 +326,10 @@ def enroll_all(
             bgr_orig = cv2.resize(bgr_orig, (int(w * scale), int(h * scale)),
                                   interpolation=cv2.INTER_AREA)
 
-        bgr_clahe = apply_clahe(bgr_orig)
-
         # ---------------------------------------------------------------
-        # Build all 7 views: original + 6 synthetic
+        # Build 7 clean photometric & mild-tilt views
         # ---------------------------------------------------------------
-        views: list[tuple[np.ndarray, int, str]] = [
-            (bgr_clahe, 0, "original_0deg_0deg")
-        ]
-        for idx, (pitch, yaw) in enumerate(SYNTHETIC_VIEWS, start=1):
-            warped = perspective_warp(bgr_clahe, pitch, yaw)
-            label  = f"synth_{int(pitch)}deg_pitch_{int(yaw):+d}deg_yaw"
-            views.append((warped, idx, label))
+        views = generate_photometric_views(bgr_orig)
 
         # ---------------------------------------------------------------
         # Extract embeddings for all views
@@ -410,21 +350,36 @@ def enroll_all(
         log.info(f"  Extracted {len(person_embeddings)}/7 embeddings")
 
         # ---------------------------------------------------------------
-        # Add to FAISS and SQLite
+        # Compute L2-normalized Centroid Template
+        # ---------------------------------------------------------------
+        embs_matrix = np.array([emb for emb, _, _ in person_embeddings], dtype=np.float32)
+        centroid = np.mean(embs_matrix, axis=0)
+        c_norm = np.linalg.norm(centroid)
+        if c_norm > 0:
+            centroid = (centroid / c_norm).astype(np.float32)
+
+        # ---------------------------------------------------------------
+        # Add Centroid + Views to FAISS and SQLite
         # ---------------------------------------------------------------
         insert_person(conn, person_id, person_name, str(photo_path))
 
+        # Store Centroid Embedding first (view_index=0)
+        faiss_id = index.ntotal
+        index.add(centroid.reshape(1, -1))
+        insert_vector_row(conn, faiss_id, person_id, 0, "centroid_template")
+        vectors_added += 1
+
+        # Store individual view embeddings
         for emb, view_idx, view_label in person_embeddings:
-            faiss_id = index.ntotal          # next available row ID
-            vec_matrix = emb.reshape(1, -1)
-            index.add(vec_matrix)
+            faiss_id = index.ntotal
+            index.add(emb.reshape(1, -1))
             insert_vector_row(conn, faiss_id, person_id, view_idx, view_label)
             vectors_added += 1
 
         conn.commit()
         enrolled_count += 1
         log.info(f"  ✓ Enrolled [{person_id}] {person_name} "
-                 f"({len(person_embeddings)} vectors)")
+                 f"({len(person_embeddings)} views + Centroid Template)")
 
     # ------------------------------------------------------------------
     # Persist FAISS index
