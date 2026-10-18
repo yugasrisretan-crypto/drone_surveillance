@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Large weight files (downloaded automatically or stored in releases)
+*.pt
+*.onnx
+weights/
+
+# Video / Storage / Local demo data
+storage/
+scratch/
+data/videos/
+data/recordings/
+data/id_cards/WhatsApp*
+*.mp4
+*.avi
+*.mkv
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

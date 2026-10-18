@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Campus Guardian — Command Center</title>
+  <meta name="description" content="Autonomous Drone Campus Surveillance — Real-Time Intruder Detection Command Center" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* ================================================================
+       DESIGN TOKENS
+    ================================================================ */
+    :root {
+      --bg-base:     #040911;
+      --bg-panel:    #080f1e;
+      --bg-card:     #0c1526;
+      --bg-input:    #060d1b;
+      --border:      #142840;
+      --border-hi:   #1a4070;
+      --border-glow: #1e60aa;
+
+      --known:         #00e676;
+      --known-dim:     #00c85a44;
+      --card-verified: #00e676;
+      --known-no-badge: #00b0ff;
+      --scanning-face: #ffd740;
+      --unknown:       #ff1744;
+      --unknown-dim:   #ff174430;
+      --evasive:       #ff9100;
+      --evasive-dim:   #ff910030;
+      --pending:       #78909c;
+      --unverifiable:  #ffd740;
+
+      --text:       #c8d8ea;
+      --text-dim:   #4a6070;
+      --text-mid:   #8099b0;
+      --text-hi:    #e8f2ff;
+
+      --accent:     #0a84ff;
+      --accent-lo:  #0a84ff18;
+      --accent-hi:  #3399ff;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-base);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+    }
+
+    /* ================================================================
+       HEADER
+    ================================================================ */
+    header {
+      height: 54px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 18px;
+      gap: 18px;
+      flex-shrink: 0;
+      position: relative;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-hi);
+      letter-spacing: 0.08em;
+      white-space: nowrap;
+    }
+    .brand-icon { font-size: 20px; filter: drop-shadow(0 0 6px #00e67688); }
+
+    .divider { width: 1px; height: 28px; background: var(--border); flex-shrink: 0; }
+
+    /* Live badge */
+    .live-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 3px;
+      border: 1px solid var(--known);
+      color: var(--known);
+      animation: pulse-shadow 2.5s ease-in-out infinite;
+    }
+    .live-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--known);
+      animation: blink 1.1s step-start infinite;
+    }
+
+    /* Connection indicator */
+    .conn-info {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .conn-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--unknown);
+      transition: background 0.4s;
+      box-shadow: 0 0 0 0 transparent;
+    }
+    .conn-dot.online {
+      background: var(--known);
+      box-shadow: 0 0 6px var(--known);
+    }
+
+    /* Stats row */
+    .stats { margin-left: auto; display: flex; gap: 22px; align-items: center; }
+    .stat  { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+    .stat-v {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 17px;
+      font-weight: 500;
+      color: var(--text-hi);
+      min-width: 38px;
+      text-align: center;
+      transition: color 0.3s;
+    }
+    .stat-l {
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--text-dim);
+    }
+    .stat-v.alert-flash { color: var(--unknown) !important; }
+
+    .enroll-hdr-btn {
+      padding: 6px 14px;
+      background: var(--accent-lo);
+      border: 1px solid var(--accent);
+      border-radius: 5px;
+      color: var(--accent-hi);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+    .enroll-hdr-btn:hover { background: #0a84ff28; }
+
+    /* Source toggle pill */
+    .source-toggle {
+      display: flex;
+      align-items: center;
+      background: var(--bg-card);
+      border: 1px solid var(--border-hi);
+      border-radius: 6px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .source-toggle button {
+      padding: 5px 12px;
+      background: transparent;
+      border: none;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+      white-space: nowrap;
+      letter-spacing: 0.04em;
+    }
+    .source-toggle button.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .source-toggle button:not(.active):hover {
+      background: var(--accent-lo);
+      color: var(--text);
+    }
+
+    /* ================================================================
+       TWO-TIER HIERARCHICAL GATE FILTER BADGES
+    ================================================================ */
+    .tier-gate-bar {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-left: 6px;
+      flex-shrink: 0;
+    }
+    .tier-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-mid);
+      user-select: none;
+      outline: none;
+    }
+    .tier-badge:hover {
+      border-color: var(--border-glow);
+      background: rgba(10, 132, 255, 0.08);
+      color: var(--text-hi);
+    }
+    .badge-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-all   { background: #90a4ae; box-shadow: 0 0 4px #90a4ae; }
+    .dot-green { background: #00e676; box-shadow: 0 0 6px #00e676; animation: blink 2.2s infinite; }
+    .dot-blue  { background: #00b0ff; box-shadow: 0 0 6px #00b0ff; }
+    .dot-red   { background: #ff1744; box-shadow: 0 0 8px #ff1744; animation: alert-flash 1.2s infinite; }
+
+    .badge-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .badge-count {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 10px;
+      min-width: 18px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-hi);
+    }
+
+    /* Badge active filter states */
+    .badge-all.active-filter {
+      border-color: #90a4ae;
+      background: rgba(144, 164, 174, 0.15);
+      color: #eceff1;
+    }
+    .badge-green.active-filter {
+      border-color: #00e676;
+      background: rgba(0, 230, 118, 0.14);
+      color: #00e676;
+      box-shadow: 0 0 10px rgba(0, 230, 118, 0.25);
+    }
+    .badge-green .badge-count {
+      background: rgba(0, 230, 118, 0.22);
+      color: #00e676;
+    }
+
+    .badge-blue.active-filter {
+      border-color: #00b0ff;
+      background: rgba(0, 176, 255, 0.14);
+      color: #00b0ff;
+      box-shadow: 0 0 10px rgba(0, 176, 255, 0.25);
+    }
+    .badge-blue .badge-count {
+      background: rgba(0, 176, 255, 0.22);
+      color: #00b0ff;
+    }
+
+    .badge-red.active-filter {
+      border-color: #ff1744;
+      background: rgba(255, 23, 68, 0.18);
+      color: #ff1744;
+      box-shadow: 0 0 12px rgba(255, 23, 68, 0.35);
+    }
+    .badge-red .badge-count {
+      background: rgba(255, 23, 68, 0.28);
+      color: #ff5252;
+    }
+
+    /* ================================================================
+       MAIN LAYOUT
+    ================================================================ */
+    .workspace {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    /* ---- LEFT: video + track table ---- */
+    .left-col {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-right: 1px solid var(--border);
+    }
+
+    /* Video feed */
+    .video-wrap {
+      flex: 1;
+      position: relative;
+      background: #000;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+    }
+    /* CRT scanline */
+    .video-wrap::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg, transparent, transparent 3px,
+        rgba(0,0,0,0.04) 3px, rgba(0,0,0,0.04) 4px
+      );
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    #video-img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      display: block;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* HUD overlay (over video) */
+    .hud {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 3;
+    }
+    .hud-tl, .hud-tr, .hud-bl, .hud-br {
+      position: absolute;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: rgba(0,230,118,0.75);
+      text-shadow: 0 0 8px rgba(0,230,118,0.6);
+      line-height: 1.5;
+    }
+    .hud-tl { top: 12px; left: 14px; }
+    .hud-tr { top: 12px; right: 14px; text-align: right; }
+    .hud-bl { bottom: 12px; left: 14px; }
+    .hud-br { bottom: 12px; right: 14px; text-align: right; }
+
+    /* Corner brackets */
+    .cb { position: absolute; width: 20px; height: 20px; border-color: rgba(0,230,118,0.35); border-style: solid; border-width: 0; }
+    .cb-tl { top:  8px; left:  8px; border-top-width: 2px; border-left-width:  2px; }
+    .cb-tr { top:  8px; right: 8px; border-top-width: 2px; border-right-width: 2px; }
+    .cb-bl { bottom: 8px; left:  8px; border-bottom-width: 2px; border-left-width:  2px; }
+    .cb-br { bottom: 8px; right: 8px; border-bottom-width: 2px; border-right-width: 2px; }
+
+    /* No-signal placeholder */
+    #no-signal {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%,-50%);
+      text-align: center;
+      color: var(--text-dim);
+      font-family: 'JetBrains Mono', monospace;
+      z-index: 4;
+    }
+    #no-signal .icon { font-size: 42px; margin-bottom: 10px; opacity: 0.5; }
+    #no-signal .label { font-size: 13px; letter-spacing: 0.15em; }
+    #no-signal .sub { font-size: 10px; margin-top: 5px; opacity: 0.4; }
+
+    /* Track table */
+    .track-wrap {
+      height: 148px;
+      flex-shrink: 0;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
+      background: var(--bg-panel);
+    }
+    .track-table {
+      width: 100%;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      border-collapse: collapse;
+    }
+    .track-table thead {
+      position: sticky;
+      top: 0;
+      background: var(--bg-base);
+      z-index: 1;
+    }
+    .track-table th, .track-table td {
+      padding: 5px 11px;
+      text-align: left;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .track-table th {
+      color: var(--text-dim);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-weight: 600;
+    }
+    .track-table td { color: var(--text); }
+    .track-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+    .no-tracks-row td { text-align: center; color: var(--text-dim); padding: 20px !important; }
+
+    /* ---- RIGHT: radar + alerts ---- */
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    /* Section shared */
+    .section-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px 8px;
+      flex-shrink: 0;
+    }
+    .section-title {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--text-dim);
+    }
+    .section-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--text-mid);
+    }
+
+    /* Radar */
+    .radar-wrap {
+      flex-shrink: 0;
+      border-bottom: 1px solid var(--border);
+      padding: 0 14px 12px;
+    }
+    #radar-canvas {
+      width: 100%;
+      aspect-ratio: 1;
+      display: block;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: #040a14;
+    }
+
+    /* Alert feed */
+    .alert-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+    .alert-count-badge {
+      background: var(--unknown);
+      color: #fff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 7px;
+      border-radius: 20px;
+      min-width: 22px;
+      text-align: center;
+    }
+
+    .alert-feed {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 12px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      min-height: 0;
+    }
+    .empty-feed {
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 11px;
+      padding: 20px 0;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .alert-card {
+      background: var(--bg-card);
+      border: 1px solid;
+      border-radius: 6px;
+      padding: 9px;
+      display: flex;
+      gap: 9px;
+      align-items: flex-start;
+      animation: slide-in 0.28s ease;
+      transition: box-shadow 0.5s;
+      cursor: default;
+    }
+    .alert-card.CONFIRMED_UNKNOWN {
+      border-color: var(--unknown);
+      background: linear-gradient(135deg, var(--bg-card), #1a0008);
+    }
+    .alert-card.EVASIVE_ALERT {
+      border-color: var(--evasive);
+      background: linear-gradient(135deg, var(--bg-card), #180c00);
+    }
+    .alert-card.KNOWN_NO_BADGE {
+      border-color: var(--known-no-badge);
+      background: linear-gradient(135deg, var(--bg-card), #001224);
+    }
+    .KNOWN_NO_BADGE .type-pill { background: rgba(0, 176, 255, 0.2); color: var(--known-no-badge); }
+
+    .alert-thumb {
+      width: 54px; height: 54px;
+      object-fit: cover;
+      border-radius: 4px;
+      flex-shrink: 0;
+      background: #080e1a;
+    }
+    .alert-thumb-ph {
+      width: 54px; height: 54px;
+      border-radius: 4px;
+      background: var(--bg-panel);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      flex-shrink: 0;
+    }
+
+    .alert-body  { flex: 1; min-width: 0; }
+    .alert-title {
+      font-size: 11px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 3px;
+      color: var(--text-hi);
+    }
+    .type-pill {
+      font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-weight: 700;
+    }
+    .CONFIRMED_UNKNOWN .type-pill { background: var(--unknown-dim); color: var(--unknown); }
+    .EVASIVE_ALERT .type-pill     { background: var(--evasive-dim); color: var(--evasive); }
+
+    .alert-meta {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9px;
+      color: var(--text-dim);
+      line-height: 1.7;
+    }
+
+    /* ================================================================
+       MODAL
+    ================================================================ */
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,5,15,0.80);
+      backdrop-filter: blur(6px);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+    .overlay.open { display: flex; }
+
+    .modal {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-glow);
+      border-radius: 14px;
+      padding: 28px;
+      width: 420px;
+      box-shadow: 0 0 60px rgba(10,132,255,0.12), 0 20px 40px rgba(0,0,0,0.6);
+      animation: modal-in 0.22s ease;
+    }
+    .modal-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-hi);
+      margin-bottom: 22px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .fgrp { margin-bottom: 15px; }
+    .flbl {
+      display: block;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+    .finput {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: var(--text-hi);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .finput:focus { border-color: var(--accent); }
+
+    .drop-zone {
+      border: 2px dashed var(--border-hi);
+      border-radius: 8px;
+      padding: 22px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s, color 0.2s;
+      background: var(--bg-input);
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: var(--accent);
+      background: var(--accent-lo);
+      color: var(--text);
+    }
+    .drop-zone.has-file {
+      border-color: var(--known);
+      background: rgba(0,230,118,0.06);
+      color: var(--known);
+    }
+    .drop-icon { font-size: 26px; margin-bottom: 6px; }
+    .drop-sub  { font-size: 10px; margin-top: 4px; opacity: 0.55; }
+
+    .modal-actions { display: flex; gap: 10px; margin-top: 22px; }
+    .btn-primary {
+      flex: 1;
+      padding: 10px;
+      background: var(--accent);
+      border: none;
+      border-radius: 7px;
+      color: #fff;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+      letter-spacing: 0.03em;
+    }
+    .btn-primary:hover   { background: var(--accent-hi); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-ghost {
+      padding: 10px 18px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text-mid);
+      font-size: 13px;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .btn-ghost:hover { border-color: var(--text-mid); color: var(--text); }
+
+    .enroll-msg {
+      min-height: 18px;
+      margin-top: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      text-align: center;
+    }
+    .enroll-msg.ok  { color: var(--known); }
+    .enroll-msg.err { color: var(--unknown); }
+
+    /* ================================================================
+       STATUS COLOUR CLASSES
+    ================================================================ */
+    .s-ID_CARD_VERIFIED  { color: var(--card-verified); }
+    .s-KNOWN_NO_BADGE    { color: var(--known-no-badge); }
+    .s-SCANNING_FACE     { color: var(--scanning-face); }
+    .s-KNOWN             { color: var(--known); }
+    .s-CONFIRMED_UNKNOWN { color: var(--unknown); }
+    .s-EVASIVE_ALERT     { color: var(--evasive); }
+    .s-PENDING           { color: var(--pending); }
+    .s-UNVERIFIABLE      { color: var(--unverifiable); }
+
+    /* ================================================================
+       ANIMATIONS
+    ================================================================ */
+    @keyframes blink {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0; }
+    }
+    @keyframes pulse-shadow {
+      0%,100% { box-shadow: 0 0 4px var(--known); }
+      50%      { box-shadow: 0 0 12px var(--known); }
+    }
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateX(14px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes modal-in {
+      from { opacity: 0; transform: scale(0.95) translateY(-10px); }
+      to   { opacity: 1; transform: none; }
+    }
+    @keyframes alert-flash {
+      0%,100% { opacity: 1; }
+      50%      { opacity: 0.35; }
+    }
+
+    /* Scrollbars */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  </style>
+</head>
+<body>
+
+<!-- ====================================================================
+     HEADER
+===================================================================== -->
+<header>
+  <div class="brand">
+    <span class="brand-icon">🎯</span>
+    CAMPUS GUARDIAN
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="live-badge" id="live-badge">
+    <div class="live-dot"></div>
+    <span id="live-text">CONNECTING</span>
+  </div>
+
+  <div class="conn-info">
+    <div class="conn-dot" id="conn-dot"></div>
+    <span id="conn-label">Offline</span>
+  </div>
+
+  <!-- Source toggle -->
+  <div class="source-toggle" id="source-toggle" title="Switch video source">
+    <button id="src-webcam-btn" class="active" onclick="switchSource('webcam')">&#128249; Webcam (0)</button>
+    <button id="src-demo-btn"            onclick="switchSource('demo')">&#127909; Demo Video</button>
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Real-Time Two-Tier Hierarchical Gate Badges -->
+  <div class="tier-gate-bar" id="tier-filter-bar" title="Click filter to isolate tier">
+    <button class="tier-badge badge-all active-filter" id="filter-all-btn" onclick="setFilter('ALL')" title="All Tracks">
+      <span class="badge-dot dot-all"></span>
+      <span class="badge-title">All</span>
+      <span class="badge-count" id="all-count">0</span>
+    </button>
+    <button class="tier-badge badge-green" id="filter-card-btn" onclick="setFilter('ID_CARD_VERIFIED')" title="Filter: Wearing ID Card">
+      <span class="badge-dot dot-green"></span>
+      <span class="badge-title">Wearing ID Card</span>
+      <span class="badge-count" id="id-card-count">0</span>
+    </button>
+    <button class="tier-badge badge-blue" id="filter-known-btn" onclick="setFilter('KNOWN_NO_BADGE')" title="Filter: Known Face Without ID Card">
+      <span class="badge-dot dot-blue"></span>
+      <span class="badge-title">Known (No ID)</span>
+      <span class="badge-count" id="known-no-badge-count">0</span>
+    </button>
+    <button class="tier-badge badge-red" id="filter-unknown-btn" onclick="setFilter('CONFIRMED_UNKNOWN')" title="Filter: No ID Card + Unknown Intruder">
+      <span class="badge-dot dot-red"></span>
+      <span class="badge-title">No ID + Unknown Intruder</span>
+      <span class="badge-count" id="unknown-intruder-count">0</span>
+    </button>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-v" id="fps-v">—</div>
+      <div class="stat-l">FPS</div>
+    </div>
+    <div class="stat">
+      <div class="stat-v" id="tracked-v">0</div>
+      <div class="stat-l">Tracked</div>
+    </div>
+    <div class="stat">
+      <div class="stat-v" id="enrolled-v">—</div>
+      <div class="stat-l">Enrolled</div>
+    </div>
+    <div class="stat">
+      <div class="stat-v" id="alert-v" style="color:var(--unknown)">0</div>
+      <div class="stat-l">Alerts</div>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+  <button class="enroll-hdr-btn" onclick="openEnroll()">⊕ Enroll ID Card</button>
+</header>
+
+<!-- ====================================================================
+     WORKSPACE
+===================================================================== -->
+<div class="workspace">
+
+  <!-- LEFT COLUMN -->
+  <div class="left-col">
+
+    <!-- Video feed -->
+    <div class="video-wrap" id="video-wrap">
+      <img id="video-img" alt="Drone Feed" />
+
+      <!-- HUD overlay -->
+      <div class="hud">
+        <div class="cb cb-tl"></div>
+        <div class="cb cb-tr"></div>
+        <div class="cb cb-bl"></div>
+        <div class="cb cb-br"></div>
+        <div class="hud-tl">DRONE CAM · CH-01<br><span id="hud-mode">SURVEILLANCE MODE</span></div>
+        <div class="hud-tr" id="hud-ts"></div>
+        <div class="hud-bl">CAMPUS GUARDIAN v1.0</div>
+        <div class="hud-br" id="hud-frame">FRAME ——</div>
+      </div>
+
+      <!-- No-signal -->
+      <div id="no-signal">
+        <div class="icon">📡</div>
+        <div class="label">AWAITING SIGNAL</div>
+        <div class="sub">Connecting to drone feed…</div>
+      </div>
+    </div>
+
+    <!-- Track table -->
+    <div class="track-wrap">
+      <table class="track-table">
+        <thead>
+          <tr>
+            <th>Track</th>
+            <th>Gate Status</th>
+            <th>Identity</th>
+            <th>ID Card</th>
+            <th>S₁</th>
+            <th>Z-Score</th>
+            <th>Pose</th>
+            <th>Radar (x,y)</th>
+          </tr>
+        </thead>
+        <tbody id="track-body">
+          <tr class="no-tracks-row"><td colspan="8">No active tracks</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div><!-- /left-col -->
+
+  <!-- RIGHT COLUMN -->
+  <div class="right-col">
+
+    <!-- Campus Radar -->
+    <div class="radar-wrap">
+      <div class="section-hdr">
+        <span class="section-title">📍 Campus Radar</span>
+        <span class="section-badge" id="radar-lbl">0 entities</span>
+      </div>
+      <canvas id="radar-canvas" width="332" height="332"></canvas>
+    </div>
+
+    <!-- Alert feed -->
+    <div class="alert-col">
+      <div class="section-hdr">
+        <span class="section-title">🚨 Intruder Alerts</span>
+        <span class="alert-count-badge" id="alert-badge">0</span>
+      </div>
+      <div class="alert-feed" id="alert-feed">
+        <div class="empty-feed" id="alert-empty">System nominal — no alerts</div>
+      </div>
+    </div>
+
+  </div><!-- /right-col -->
+</div><!-- /workspace -->
+
+<!-- ====================================================================
+     ENROLL MODAL
+===================================================================== -->
+<div class="overlay" id="enroll-overlay" onclick="overlayClick(event)">
+  <div class="modal" id="enroll-modal">
+    <div class="modal-title">⊕ Enroll New ID Card</div>
+
+    <div class="fgrp">
+      <label class="flbl" for="e-id">Employee / Student ID</label>
+      <input class="finput" id="e-id" type="text" placeholder="EMP002" autocomplete="off" />
+    </div>
+    <div class="fgrp">
+      <label class="flbl" for="e-name">Full Name</label>
+      <input class="finput" id="e-name" type="text" placeholder="Jane Smith" autocomplete="off" />
+    </div>
+    <div class="fgrp">
+      <label class="flbl">ID Card Photo</label>
+      <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-inp').click()">
+        <div class="drop-icon">📷</div>
+        <div>Click or drag frontal portrait photo here</div>
+        <div class="drop-sub">JPEG · PNG · max 10 MB</div>
+      </div>
+      <input type="file" id="file-inp" accept="image/*" style="display:none" onchange="fileChosen(this)" />
+    </div>
+
+    <div class="enroll-msg" id="enroll-msg"></div>
+
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeEnroll()">Cancel</button>
+      <button class="btn-primary" id="enroll-btn" onclick="submitEnroll()">Enroll</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====================================================================
+     JAVASCRIPT
+===================================================================== -->
+<script>
+"use strict";
+
+// =========================================================================
+// CONFIG
+// =========================================================================
+const STATUS_COLOR = {
+  ID_CARD_VERIFIED:  '#00e676', // Bright Green
+  KNOWN_NO_BADGE:    '#00b0ff', // Blue / Teal
+  SCANNING_FACE:     '#ffd740', // Yellow
+  CONFIRMED_UNKNOWN: '#ff1744', // Red
+  EVASIVE_ALERT:     '#ff9100', // Orange
+  PENDING:           '#78909c', // Grey
+  UNVERIFIABLE:      '#ffb300', // Amber
+  KNOWN:             '#00e676',
+};
+
+const STATUS_LABEL = {
+  ID_CARD_VERIFIED:  'ID CARD WORN',
+  KNOWN_NO_BADGE:    'KNOWN (NO ID)',
+  SCANNING_FACE:     'SCANNING FACE',
+  CONFIRMED_UNKNOWN: 'INTRUDER',
+  EVASIVE_ALERT:     'EVASIVE',
+  PENDING:           'CHECKING ID',
+  UNVERIFIABLE:      'UNVERIFIABLE',
+  KNOWN:             'ID VERIFIED',
+};
+
+// =========================================================================
+// STATE
+// =========================================================================
+let ws            = null;
+let reconnTimer   = null;
+let alertCount    = 0;
+let latestPersons = [];
+let selectedFile  = null;
+let audioCtx      = null;
+let sweepAngle    = 0;
+let pulseRings    = [];   // [{x,y,r,alpha,color}]
+let radarAFid     = null;
+let currentFilter = 'ALL';
+
+// =========================================================================
+// Two-Tier Filter Management
+// =========================================================================
+function setFilter(filt) {
+  currentFilter = filt;
+  document.querySelectorAll('.tier-badge').forEach(b => b.classList.remove('active-filter'));
+  if (filt === 'ALL') {
+    const el = document.getElementById('filter-all-btn');
+    if (el) el.classList.add('active-filter');
+  } else if (filt === 'ID_CARD_VERIFIED') {
+    const el = document.getElementById('filter-card-btn');
+    if (el) el.classList.add('active-filter');
+  } else if (filt === 'KNOWN_NO_BADGE') {
+    const el = document.getElementById('filter-known-btn');
+    if (el) el.classList.add('active-filter');
+  } else if (filt === 'CONFIRMED_UNKNOWN') {
+    const el = document.getElementById('filter-unknown-btn');
+    if (el) el.classList.add('active-filter');
+  }
+  updateTrackTable(filteredPersons(latestPersons));
+}
+
+function filteredPersons(persons) {
+  if (!persons) return [];
+  if (currentFilter === 'ALL') return persons;
+  if (currentFilter === 'ID_CARD_VERIFIED') return persons.filter(p => p.status === 'ID_CARD_VERIFIED');
+  if (currentFilter === 'KNOWN_NO_BADGE') return persons.filter(p => p.status === 'KNOWN_NO_BADGE');
+  if (currentFilter === 'CONFIRMED_UNKNOWN') return persons.filter(p => p.status === 'CONFIRMED_UNKNOWN' || p.status === 'EVASIVE_ALERT');
+  return persons;
+}
+
+// =========================================================================
+// WebSocket & MJPEG Stream Fallback
+// =========================================================================
+let framesReceived = 0;
+let mjpegFallbackActive = false;
+
+function activateMjpegFallback() {
+  if (mjpegFallbackActive) return;
+  mjpegFallbackActive = true;
+  console.warn("Activating /video_feed MJPEG stream fallback");
+  videoImg.src = "/video_feed";
+  noSignalEl.style.display = 'none';
+  videoImg.style.display   = 'block';
+  firstFrame = false;
+}
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  try {
+    ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  } catch (err) {
+    console.error("WS init error:", err);
+    activateMjpegFallback();
+    return;
+  }
+
+  ws.onopen = () => {
+    setOnline(true);
+    clearTimeout(reconnTimer);
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if      (msg.type === 'frame') onFrame(msg);
+      else if (msg.type === 'alert' || msg.type === 'badge_warning') onAlert(msg);
+    } catch (_) {}
+  };
+
+  ws.onerror = () => {
+    setOnline(false);
+    if (framesReceived === 0) {
+      activateMjpegFallback();
+    }
+  };
+  ws.onclose = () => {
+    setOnline(false);
+    if (framesReceived === 0) {
+      activateMjpegFallback();
+    }
+    reconnTimer = setTimeout(connectWS, 3000);
+  };
+}
+
+// Watchdog: If WebSocket receives 0 frames after 2.5s, fall back to /video_feed
+setTimeout(() => {
+  if (framesReceived === 0) {
+    activateMjpegFallback();
+  }
+}, 2500);
+
+function setOnline(ok) {
+  document.getElementById('conn-dot').className  = 'conn-dot' + (ok ? ' online' : '');
+  document.getElementById('conn-label').textContent = ok ? 'Connected' : 'Reconnecting…';
+  document.getElementById('live-text').textContent  = ok ? 'LIVE'       : 'OFFLINE';
+}
+
+// =========================================================================
+// Frame handler
+// =========================================================================
+const videoImg   = document.getElementById('video-img');
+const noSignalEl = document.getElementById('no-signal');
+let firstFrame   = true;
+
+videoImg.onerror = () => {
+  if (!mjpegFallbackActive) {
+    activateMjpegFallback();
+  }
+};
+
+function onFrame(msg) {
+  framesReceived++;
+  // Video image
+  if (!mjpegFallbackActive) {
+    videoImg.src = 'data:image/jpeg;base64,' + msg.frame;
+  }
+  if (firstFrame) {
+    noSignalEl.style.display = 'none';
+    videoImg.style.display   = 'block';
+    firstFrame = false;
+  }
+
+  // Reflect active source from server (keeps toggle in sync after fallback)
+  if (msg.source && msg.source !== activeSource) {
+    _applySourceUI(msg.source);
+  }
+
+  // Header stats
+  document.getElementById('fps-v').textContent      = msg.fps.toFixed(1);
+  document.getElementById('tracked-v').textContent  = msg.persons.length;
+  document.getElementById('enrolled-v').textContent = msg.enrolled_count;
+
+  // Real-Time Two-Tier Hierarchical Gate Badges
+  const idCount = msg.id_card_count !== undefined
+    ? msg.id_card_count
+    : msg.persons.filter(p => p.status === 'ID_CARD_VERIFIED').length;
+  const knownNoBadgeCount = msg.known_no_badge_count !== undefined
+    ? msg.known_no_badge_count
+    : msg.persons.filter(p => p.status === 'KNOWN_NO_BADGE').length;
+  const unknownCount = msg.unknown_intruder_count !== undefined
+    ? msg.unknown_intruder_count
+    : msg.persons.filter(p => p.status === 'CONFIRMED_UNKNOWN' || p.status === 'EVASIVE_ALERT').length;
+
+  const elIdCard = document.getElementById('id-card-count');
+  if (elIdCard) elIdCard.textContent = idCount;
+  const elKnownNoBadge = document.getElementById('known-no-badge-count');
+  if (elKnownNoBadge) elKnownNoBadge.textContent = knownNoBadgeCount;
+  const elUnknown = document.getElementById('unknown-intruder-count');
+  if (elUnknown) elUnknown.textContent = unknownCount;
+  const elAll = document.getElementById('all-count');
+  if (elAll) elAll.textContent = msg.persons.length;
+
+  // HUD
+  document.getElementById('hud-frame').textContent =
+    'FRAME ' + String(msg.frame_idx).padStart(5, '0');
+
+  // Track table
+  latestPersons = msg.persons;
+  updateTrackTable(filteredPersons(msg.persons));
+}
+
+// =========================================================================
+// Track table
+// =========================================================================
+function updateTrackTable(persons) {
+  const tbody = document.getElementById('track-body');
+  if (!persons || !persons.length) {
+    tbody.innerHTML = '<tr class="no-tracks-row"><td colspan="8">No tracks matching filter</td></tr>';
+    return;
+  }
+  tbody.innerHTML = persons.map(p => {
+    const col   = STATUS_COLOR[p.status] || '#78909c';
+    const lbl   = STATUS_LABEL[p.status] || p.status;
+    const name  = p.person_name || '—';
+    const cardBadge = p.has_id_card
+      ? `<span style="color:#00e676;font-weight:600">✓ WORN (${(p.card_conf || 0.95).toFixed(2)})</span>`
+      : `<span style="color:#78909c">NONE</span>`;
+
+    return `<tr>
+      <td style="font-weight:600">T${p.track_id}</td>
+      <td><span class="s-${p.status}" style="font-weight:600;color:${col}">${lbl}</span></td>
+      <td style="color:${p.person_name ? '#e8f2ff' : 'var(--text-dim)'}">${name}</td>
+      <td>${cardBadge}</td>
+      <td>${p.s1 > 0 ? p.s1.toFixed(3) : '—'}</td>
+      <td>${p.z_score > 0 ? p.z_score.toFixed(2) : '—'}</td>
+      <td>${p.yaw_deg.toFixed(0)}° / ${p.pitch_deg.toFixed(0)}°</td>
+      <td style="color:var(--text-dim)">(${Math.round(p.radar_xy[0])},${Math.round(p.radar_xy[1])})</td>
+    </tr>`;
+  }).join('');
+}
+
+// =========================================================================
+// Radar canvas — continuous animation loop
+// =========================================================================
+const rc  = document.getElementById('radar-canvas');
+const rct = rc.getContext('2d');
+
+function drawRadar() {
+  const W = rc.width, H = rc.height;
+  const ctx = rct;
+
+  // Background
+  ctx.fillStyle = '#040a14';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(20,80,140,0.3)';
+  ctx.lineWidth   = 0.5;
+  const COLS = 8, ROWS = 8;
+  for (let i = 0; i <= COLS; i++) {
+    const x = i * W / COLS;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let i = 0; i <= ROWS; i++) {
+    const y = i * H / ROWS;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // Campus boundary glow
+  ctx.strokeStyle = 'rgba(0,200,100,0.15)';
+  ctx.lineWidth   = 1;
+  ctx.strokeRect(6, 6, W - 12, H - 12);
+
+  // Compass labels
+  ctx.fillStyle = 'rgba(60,100,130,0.7)';
+  ctx.font      = '8px JetBrains Mono, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('N', W / 2, 14);
+  ctx.fillText('S', W / 2, H - 4);
+  ctx.textAlign = 'left';
+  ctx.fillText('W', 4, H / 2 + 3);
+  ctx.textAlign = 'right';
+  ctx.fillText('E', W - 4, H / 2 + 3);
+  ctx.textAlign = 'left';
+
+  // Radar sweep sector
+  sweepAngle = (sweepAngle + 1.8) % 360;
+  const cx = W / 2, cy = H / 2;
+  const sweepRad = (sweepAngle * Math.PI) / 180;
+  ctx.save();
+  ctx.globalAlpha = 0.10;
+  ctx.fillStyle   = '#00e676';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, Math.max(W, H), sweepRad - 0.55, sweepRad, false);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // Pulse rings (intruder beacons)
+  for (let i = pulseRings.length - 1; i >= 0; i--) {
+    const pr = pulseRings[i];
+    pr.r     += 1.2;
+    pr.alpha *= 0.93;
+    if (pr.alpha < 0.01) { pulseRings.splice(i, 1); continue; }
+    ctx.beginPath();
+    ctx.arc(pr.x, pr.y, pr.r, 0, Math.PI * 2);
+    ctx.strokeStyle  = pr.color;
+    ctx.lineWidth    = 1.5;
+    ctx.globalAlpha  = pr.alpha;
+    ctx.stroke();
+    ctx.globalAlpha  = 1;
+  }
+
+  // Person dots
+  const persons = latestPersons;
+  persons.forEach(p => {
+    const x     = p.radar_xy[0] / 1000 * (W - 16) + 8;
+    const y     = p.radar_xy[1] / 1000 * (H - 16) + 8;
+    const color = STATUS_COLOR[p.status] || '#607d8b';
+    const r     = p.status === 'CONFIRMED_UNKNOWN' ? 7 : 5;
+
+    // Glow shadow
+    ctx.shadowColor = color;
+    ctx.shadowBlur  = 14;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.shadowBlur  = 0;
+
+    // Track label
+    ctx.fillStyle = color;
+    ctx.font      = '8px JetBrains Mono, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`T${p.track_id}`, x + r + 2, y + 3);
+
+    // Spawn pulse ring for intruders occasionally
+    if (p.status === 'CONFIRMED_UNKNOWN' && Math.random() < 0.04) {
+      pulseRings.push({ x, y, r, alpha: 0.9, color });
+    }
+  });
+
+  document.getElementById('radar-lbl').textContent =
+    `${persons.length} entit${persons.length === 1 ? 'y' : 'ies'}`;
+
+  radarAFid = requestAnimationFrame(drawRadar);
+}
+drawRadar();   // ← start animation loop
+
+// =========================================================================
+// Alert handler
+// =========================================================================
+function onAlert(msg) {
+  const isIntruder = msg.is_intruder !== false && (msg.status === 'CONFIRMED_UNKNOWN' || msg.status === 'EVASIVE_ALERT');
+  const isBadgeWarning = msg.status === 'KNOWN_NO_BADGE' || msg.type === 'badge_warning';
+
+  if (isIntruder) {
+    alertCount++;
+    document.getElementById('alert-v').textContent     = alertCount;
+    document.getElementById('alert-badge').textContent = alertCount;
+  }
+
+  // Remove empty placeholder
+  const ph = document.getElementById('alert-empty');
+  if (ph) ph.remove();
+
+  const feed       = document.getElementById('alert-feed');
+  const ts         = msg.timestamp_str || new Date(msg.timestamp * 1000)
+                       .toLocaleTimeString('en-GB', { hour12: false });
+
+  const card = document.createElement('div');
+  card.className = `alert-card ${msg.status}`;
+
+  const icon = isIntruder ? '🚨' : (isBadgeWarning ? '🪪' : '⚠️');
+  const pillText = isIntruder ? 'INTRUDER' : (isBadgeWarning ? 'NO ID CARD' : 'EVASIVE');
+
+  card.innerHTML = `
+    ${msg.snapshot_url
+      ? `<img class="alert-thumb" src="${msg.snapshot_url}" alt="Snapshot"
+             onerror="this.outerHTML='<div class=\\'alert-thumb-ph\\'>${icon}</div>'">`
+      : `<div class="alert-thumb-ph">${icon}</div>`
+    }
+    <div class="alert-body">
+      <div class="alert-title">
+        Track #${msg.track_id} ${msg.person_name ? '· ' + msg.person_name : ''}
+        <span class="type-pill">${pillText}</span>
+      </div>
+      <div class="alert-meta">
+        ${ts}<br>
+        ${isBadgeWarning ? 'Face verified, badge missing' : `S₁ ${msg.s1.toFixed(3)} · Z ${msg.z_score.toFixed(2)}`}
+      </div>
+    </div>`;
+
+  feed.insertBefore(card, feed.firstChild);
+
+  if (isIntruder) {
+    // Brief glow flash
+    const glowColor = 'var(--unknown)';
+    card.style.boxShadow = `0 0 22px ${glowColor}`;
+    setTimeout(() => { card.style.boxShadow = ''; }, 900);
+
+    // Flash header counter
+    const av = document.getElementById('alert-v');
+    av.classList.add('alert-flash');
+    setTimeout(() => av.classList.remove('alert-flash'), 800);
+
+    // Audio alarm
+    playAlarm(true);
+  }
+}
+
+// =========================================================================
+// Web Audio alarm
+// =========================================================================
+function ensureAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return audioCtx;
+}
+
+document.addEventListener('click', ensureAudio, { once: true });
+
+function playAlarm(isIntruder) {
+  try {
+    const ctx   = ensureAudio();
+    const seqs  = isIntruder
+      ? [880, 1100, 880, 1100]   // urgent double-beep
+      : [440, 550, 440];          // lower evasive tone
+    seqs.forEach((freq, i) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type           = isIntruder ? 'square' : 'sine';
+      osc.frequency.value = freq;
+      const t = ctx.currentTime + i * 0.13;
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.14, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+      osc.start(t);
+      osc.stop(t + 0.15);
+    });
+  } catch (_) {}
+}
+
+// =========================================================================
+// HUD clock
+// =========================================================================
+function tickClock() {
+  document.getElementById('hud-ts').textContent =
+    new Date().toLocaleTimeString('en-GB', { hour12: false });
+}
+tickClock();
+setInterval(tickClock, 1000);
+
+// =========================================================================
+// Enroll modal
+// =========================================================================
+function openEnroll() {
+  selectedFile = null;
+  document.getElementById('enroll-msg').textContent  = '';
+  document.getElementById('enroll-msg').className    = 'enroll-msg';
+  document.getElementById('e-id').value              = '';
+  document.getElementById('e-name').value            = '';
+  document.getElementById('enroll-btn').disabled     = false;
+  document.getElementById('enroll-btn').textContent  = 'Enroll';
+  resetDropZone();
+  document.getElementById('enroll-overlay').classList.add('open');
+}
+
+function closeEnroll() {
+  document.getElementById('enroll-overlay').classList.remove('open');
+}
+
+function overlayClick(e) {
+  if (e.target === document.getElementById('enroll-overlay')) closeEnroll();
+}
+
+function resetDropZone() {
+  const dz = document.getElementById('drop-zone');
+  dz.className = 'drop-zone';
+  dz.innerHTML = `
+    <div class="drop-icon">📷</div>
+    <div>Click or drag frontal portrait photo here</div>
+    <div class="drop-sub">JPEG · PNG · max 10 MB</div>`;
+}
+
+function fileChosen(inp) {
+  if (inp.files[0]) setFile(inp.files[0]);
+}
+
+function setFile(file) {
+  selectedFile = file;
+  const dz = document.getElementById('drop-zone');
+  dz.className = 'drop-zone has-file';
+  dz.innerHTML = `
+    <div class="drop-icon">✅</div>
+    <div>${file.name}</div>
+    <div class="drop-sub">${(file.size / 1024).toFixed(0)} KB — ready</div>`;
+}
+
+// Drag-and-drop
+const dz = document.getElementById('drop-zone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave',      () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('drag-over');
+  const f = e.dataTransfer.files[0];
+  if (f) setFile(f);
+});
+
+async function submitEnroll() {
+  const pid  = document.getElementById('e-id').value.trim();
+  const name = document.getElementById('e-name').value.trim();
+  const msg  = document.getElementById('enroll-msg');
+
+  if (!pid || !name || !selectedFile) {
+    msg.className   = 'enroll-msg err';
+    msg.textContent = '✗ Complete all fields and select a photo.';
+    return;
+  }
+
+  const btn = document.getElementById('enroll-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Enrolling…';
+  msg.className   = 'enroll-msg';
+  msg.textContent = '';
+
+  const form = new FormData();
+  form.append('person_id',   pid);
+  form.append('person_name', name);
+  form.append('file', selectedFile, selectedFile.name);
+
+  try {
+    const resp = await fetch('/api/enroll', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (resp.ok && data.success) {
+      msg.className   = 'enroll-msg ok';
+      msg.textContent = `✓ ${data.message}`;
+      document.getElementById('enrolled-v').textContent = data.enrolled_total;
+      setTimeout(closeEnroll, 2200);
+    } else {
+      msg.className   = 'enroll-msg err';
+      msg.textContent = `✗ ${data.detail || 'Enrollment failed.'}`;
+      btn.disabled    = false;
+      btn.textContent = 'Enroll';
+    }
+  } catch (_) {
+    msg.className   = 'enroll-msg err';
+    msg.textContent = '✗ Network error — check server.';
+    btn.disabled    = false;
+    btn.textContent = 'Enroll';
+  }
+}
+
+// =========================================================================
+// Load historical alerts on page start
+// =========================================================================
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/alerts?limit=8');
+    if (!r.ok) return;
+    const list = await r.json();
+    // Show oldest first (they'll be prepended newest-first in onAlert)
+    list.reverse().forEach(a => onAlert({
+      track_id:      a.track_id,
+      status:        a.alert_type,
+      snapshot_url:  a.snapshot_url,
+      timestamp:     a.timestamp,
+      timestamp_str: a.timestamp_str,
+      s1:            a.s1,
+      z_score:       a.z_score,
+    }));
+  } catch (_) {}
+}
+
+// =========================================================================
+// Video source toggle
+// =========================================================================
+let activeSource    = 'webcam';   // mirrors server's _current_source
+let sourceSwitching = false;
+
+function _applySourceUI(src) {
+  activeSource = src;
+  const isWebcam = src === 'webcam';
+  document.getElementById('src-webcam-btn').classList.toggle('active', isWebcam);
+  document.getElementById('src-demo-btn').classList.toggle('active', !isWebcam);
+  document.getElementById('hud-mode').textContent =
+    isWebcam ? 'WEBCAM \u00B7 CAP_DSHOW' : 'DEMO DRONE VIDEO';
+}
+
+async function switchSource(src) {
+  if (src === activeSource || sourceSwitching) return;
+  sourceSwitching = true;
+  try {
+    const r = await fetch(`/api/source?source=${src}`, { method: 'POST' });
+    if (r.ok) {
+      _applySourceUI(src);
+      // Reset no-signal while new cap opens
+      firstFrame = true;
+      noSignalEl.style.display = '';
+      videoImg.style.display   = 'none';
+    }
+  } catch (_) {}
+  sourceSwitching = false;
+}
+
+// =========================================================================
+// INIT
+// =========================================================================
+connectWS();
+loadHistory();
+</script>
+</body>
+</html>

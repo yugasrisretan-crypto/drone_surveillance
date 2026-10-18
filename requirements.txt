@@ -1,0 +1,35 @@
+# ============================================================
+# Autonomous Drone Campus Surveillance System
+# Python Dependencies — CPU-only build
+# ============================================================
+
+# ONNX inference runtime — standard CPU build (no CUDA required).
+onnxruntime
+
+# Face detection + ArcFace embedding (uses ONNX Runtime internally)
+insightface
+
+# YOLOv11 person detection (ultralytics handles model download)
+ultralytics
+
+# ByteTrack multi-object tracking + annotation helpers
+supervision
+# ByteTrackTracker — official replacement for sv.ByteTracker (deprecated sv>=0.28)
+trackers
+
+# Facebook AI Similarity Search — CPU build
+faiss-cpu
+
+# Async REST + WebSocket backend
+fastapi
+uvicorn[standard]
+websockets
+
+# File upload support for FastAPI
+python-multipart
+
+# Video I/O — headless (no Qt/GTK GUI dependencies)
+opencv-python-headless
+
+# Scientific computing utilities (cosine distance, etc.)
+scipy
