@@ -355,7 +355,7 @@
       z-index: 2;
     }
 
-    #video-img {
+    #video-img, #videoFeed {
       max-width: 100%;
       max-height: 100%;
       object-fit: contain;
@@ -829,7 +829,7 @@
   </div>
 
   <div class="divider"></div>
-  <button class="calibrate-hdr-btn" id="btn-calibrate-live" onclick="calibrateLiveFace()" title="Instant Live Self-Calibration from Webcam">⚡ 1-Click Calibrate Face from Webcam</button>
+  <button class="calibrate-hdr-btn" id="btn-calibrate-live" onclick="calibrateLiveFace()" title="Instant Live Self-Calibration from Webcam">📸 Enroll / Calibrate My Face Live</button>
   <button class="enroll-hdr-btn" onclick="openEnroll()">⊕ Enroll ID Card</button>
 </header>
 
@@ -843,7 +843,7 @@
 
     <!-- Video feed -->
     <div class="video-wrap" id="video-wrap">
-      <img id="video-img" alt="Drone Feed" />
+      <img id="videoFeed" src="/video_feed" alt="Live Surveillance Feed" />
 
       <!-- HUD overlay -->
       <div class="hud">
@@ -1028,25 +1028,13 @@ function filteredPersons(persons) {
 // WebSocket & MJPEG Stream Fallback
 // =========================================================================
 let framesReceived = 0;
-let mjpegFallbackActive = false;
-
-function activateMjpegFallback() {
-  if (mjpegFallbackActive) return;
-  mjpegFallbackActive = true;
-  console.warn("Activating /video_feed MJPEG stream fallback");
-  videoImg.src = "/video_feed";
-  noSignalEl.style.display = 'none';
-  videoImg.style.display   = 'block';
-  firstFrame = false;
-}
 
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   try {
-    ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+    ws = new WebSocket(`${proto}://${location.host}/ws/telemetry`);
   } catch (err) {
     console.error("WS init error:", err);
-    activateMjpegFallback();
     return;
   }
 
@@ -1058,32 +1046,19 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if      (msg.type === 'frame') onFrame(msg);
+      if (msg.type === 'telemetry' || msg.type === 'frame') onTelemetry(msg);
       else if (msg.type === 'alert' || msg.type === 'badge_warning') onAlert(msg);
     } catch (_) {}
   };
 
   ws.onerror = () => {
     setOnline(false);
-    if (framesReceived === 0) {
-      activateMjpegFallback();
-    }
   };
   ws.onclose = () => {
     setOnline(false);
-    if (framesReceived === 0) {
-      activateMjpegFallback();
-    }
-    reconnTimer = setTimeout(connectWS, 3000);
+    reconnTimer = setTimeout(connectWS, 2500);
   };
 }
-
-// Watchdog: If WebSocket receives 0 frames after 2.5s, fall back to /video_feed
-setTimeout(() => {
-  if (framesReceived === 0) {
-    activateMjpegFallback();
-  }
-}, 2500);
 
 function setOnline(ok) {
   document.getElementById('conn-dot').className  = 'conn-dot' + (ok ? ' online' : '');
@@ -1092,50 +1067,52 @@ function setOnline(ok) {
 }
 
 // =========================================================================
-// Frame handler
+// Video feed & Telemetry handler
 // =========================================================================
-const videoImg   = document.getElementById('video-img');
+const videoImg   = document.getElementById('videoFeed') || document.getElementById('video-img');
 const noSignalEl = document.getElementById('no-signal');
 let firstFrame   = true;
 
-videoImg.onerror = () => {
-  if (!mjpegFallbackActive) {
-    activateMjpegFallback();
-  }
-};
+if (videoImg) {
+  videoImg.onload = () => {
+    if (noSignalEl) noSignalEl.style.display = 'none';
+    videoImg.style.display = 'block';
+  };
+  videoImg.onerror = () => {
+    setTimeout(() => {
+      videoImg.src = `/video_feed?t=${Date.now()}`;
+    }, 1000);
+  };
+}
 
-function onFrame(msg) {
+function onTelemetry(msg) {
   framesReceived++;
-  // Video image
-  if (!mjpegFallbackActive) {
-    videoImg.src = 'data:image/jpeg;base64,' + msg.frame;
-  }
-  if (firstFrame) {
+  if (firstFrame && noSignalEl) {
     noSignalEl.style.display = 'none';
-    videoImg.style.display   = 'block';
+    if (videoImg) videoImg.style.display = 'block';
     firstFrame = false;
   }
 
-  // Reflect active source from server (keeps toggle in sync after fallback)
+  // Reflect active source from server (keeps toggle in sync)
   if (msg.source && msg.source !== activeSource) {
     _applySourceUI(msg.source);
   }
 
   // Header stats
-  document.getElementById('fps-v').textContent      = msg.fps.toFixed(1);
-  document.getElementById('tracked-v').textContent  = msg.persons.length;
-  document.getElementById('enrolled-v').textContent = msg.enrolled_count;
+  if (msg.fps !== undefined) document.getElementById('fps-v').textContent      = Number(msg.fps).toFixed(1);
+  if (msg.persons)          document.getElementById('tracked-v').textContent  = msg.persons.length;
+  if (msg.enrolled_count !== undefined) document.getElementById('enrolled-v').textContent = msg.enrolled_count;
 
   // Real-Time Two-Tier Hierarchical Gate Badges
   const idCount = msg.id_card_count !== undefined
     ? msg.id_card_count
-    : msg.persons.filter(p => p.status === 'ID_CARD_VERIFIED').length;
+    : (msg.persons ? msg.persons.filter(p => p.status === 'ID_CARD_VERIFIED').length : 0);
   const knownNoBadgeCount = msg.known_no_badge_count !== undefined
     ? msg.known_no_badge_count
-    : msg.persons.filter(p => p.status === 'KNOWN_NO_BADGE').length;
+    : (msg.persons ? msg.persons.filter(p => p.status === 'KNOWN_NO_BADGE').length : 0);
   const unknownCount = msg.unknown_intruder_count !== undefined
     ? msg.unknown_intruder_count
-    : msg.persons.filter(p => p.status === 'CONFIRMED_UNKNOWN' || p.status === 'EVASIVE_ALERT').length;
+    : (msg.persons ? msg.persons.filter(p => p.status === 'CONFIRMED_UNKNOWN' || p.status === 'EVASIVE_ALERT').length : 0);
 
   const elIdCard = document.getElementById('id-card-count');
   if (elIdCard) elIdCard.textContent = idCount;
@@ -1144,16 +1121,21 @@ function onFrame(msg) {
   const elUnknown = document.getElementById('unknown-intruder-count');
   if (elUnknown) elUnknown.textContent = unknownCount;
   const elAll = document.getElementById('all-count');
-  if (elAll) elAll.textContent = msg.persons.length;
+  if (elAll && msg.persons) elAll.textContent = msg.persons.length;
 
   // HUD
-  document.getElementById('hud-frame').textContent =
-    'FRAME ' + String(msg.frame_idx).padStart(5, '0');
+  if (msg.frame_idx !== undefined) {
+    document.getElementById('hud-frame').textContent =
+      'FRAME ' + String(msg.frame_idx).padStart(5, '0');
+  }
 
-  // Track table
-  latestPersons = msg.persons;
-  updateTrackTable(filteredPersons(msg.persons));
+  // Track table & radar
+  if (msg.persons) {
+    latestPersons = msg.persons;
+    updateTrackTable(filteredPersons(msg.persons));
+  }
 }
+const onFrame = onTelemetry;
 
 // =========================================================================
 // Track table
