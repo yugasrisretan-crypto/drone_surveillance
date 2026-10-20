@@ -184,6 +184,44 @@
       cursor: not-allowed;
     }
 
+    .export-hdr-btn {
+      padding: 6px 14px;
+      background: rgba(10, 132, 255, 0.12);
+      border: 1px solid var(--accent);
+      border-radius: 5px;
+      color: var(--accent-hi);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .export-hdr-btn:hover {
+      background: rgba(10, 132, 255, 0.22);
+      box-shadow: 0 0 10px rgba(10, 132, 255, 0.35);
+    }
+
+    .mute-hdr-btn {
+      padding: 6px 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text-mid);
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+    }
+    .mute-hdr-btn:hover {
+      border-color: var(--border-glow);
+      color: var(--text-hi);
+    }
+
     /* Source toggle pill */
     .source-toggle {
       display: flex;
@@ -829,7 +867,10 @@
   </div>
 
   <div class="divider"></div>
-  <button class="calibrate-hdr-btn" id="btn-calibrate-live" onclick="calibrateLiveFace()" title="Instant Live Self-Calibration from Webcam">📸 Enroll / Calibrate My Face Live</button>
+  <button class="calibrate-hdr-btn" id="btn-lock-badge" onclick="lockBadgeTemplate()" title="1-Click Lock Physical ID Card Template from Live Chest Scan Zone" style="border-color:#00e676;color:#00e676;">🪪 Lock My ID Card Template</button>
+  <button class="calibrate-hdr-btn" id="btn-calibrate-live" onclick="calibrateLiveFace()" title="Instant Live Self-Calibration from Webcam">📸 Calibrate My Face</button>
+  <button class="export-hdr-btn" id="btn-export-csv" onclick="exportCsvLog()" title="Download Security Audit CSV">📥 Export CSV Log</button>
+  <button class="mute-hdr-btn" id="btn-audio-toggle" onclick="toggleAudio()" title="Toggle Voice Alerts">🔊 Voice: ON</button>
   <button class="enroll-hdr-btn" onclick="openEnroll()">⊕ Enroll ID Card</button>
 </header>
 
@@ -906,7 +947,7 @@
         <span class="section-title">🚨 Intruder Alerts</span>
         <span class="alert-count-badge" id="alert-badge">0</span>
       </div>
-      <div class="alert-feed" id="alert-feed">
+      <div class="alert-feed" id="alertList">
         <div class="empty-feed" id="alert-empty">System nominal — no alerts</div>
       </div>
     </div>
@@ -1277,6 +1318,35 @@ function drawRadar() {
 drawRadar();   // ← start animation loop
 
 // =========================================================================
+// Voice & Export CSV Utilities
+// =========================================================================
+let voiceEnabled = true;
+
+function toggleAudio() {
+  voiceEnabled = !voiceEnabled;
+  const btn = document.getElementById('btn-audio-toggle');
+  if (btn) {
+    btn.textContent = voiceEnabled ? '🔊 Voice: ON' : '🔇 Voice: OFF';
+    btn.style.color = voiceEnabled ? 'var(--known)' : 'var(--text-dim)';
+  }
+}
+
+function speakAlert(text) {
+  if (!voiceEnabled || !('speechSynthesis' in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 1.0;
+    utter.pitch = 1.0;
+    window.speechSynthesis.speak(utter);
+  } catch (_) {}
+}
+
+function exportCsvLog() {
+  window.location.href = '/api/export_csv';
+}
+
+// =========================================================================
 // Alert handler
 // =========================================================================
 function onAlert(msg) {
@@ -1293,9 +1363,9 @@ function onAlert(msg) {
   const ph = document.getElementById('alert-empty');
   if (ph) ph.remove();
 
-  const feed       = document.getElementById('alert-feed');
-  const ts         = msg.timestamp_str || new Date(msg.timestamp * 1000)
-                       .toLocaleTimeString('en-GB', { hour12: false });
+  const feed = document.getElementById('alertList') || document.getElementById('alert-feed');
+  const ts   = msg.timestamp_str || new Date(msg.timestamp * 1000)
+                 .toLocaleTimeString('en-GB', { hour12: false });
 
   const card = document.createElement('div');
   card.className = `alert-card ${msg.status}`;
@@ -1320,7 +1390,7 @@ function onAlert(msg) {
       </div>
     </div>`;
 
-  feed.insertBefore(card, feed.firstChild);
+  if (feed) feed.insertBefore(card, feed.firstChild);
 
   if (isIntruder) {
     // Brief glow flash
@@ -1333,8 +1403,12 @@ function onAlert(msg) {
     av.classList.add('alert-flash');
     setTimeout(() => av.classList.remove('alert-flash'), 800);
 
-    // Audio alarm
+    // Browser audio alarm + speech alert
     playAlarm(true);
+    speakAlert("Security Alert. Unknown person without ID card detected.");
+  } else if (isBadgeWarning) {
+    playAlarm(false);
+    speakAlert(`Attention ${msg.person_name || 'Student'}, please display your ID card.`);
   }
 }
 
@@ -1506,6 +1580,30 @@ async function calibrateLiveFace() {
     }
   } catch (err) {
     alert('❌ Network error during calibration. Check server.');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+  }
+}
+
+// =========================================================================
+// 1-Click Worn ID Card Template Lock
+// =========================================================================
+async function lockBadgeTemplate() {
+  const btn = document.getElementById('btn-lock-badge');
+  btn.disabled = true;
+  const originalHtml = btn.innerHTML;
+  btn.innerHTML = '⏳ Locking…';
+  try {
+    const resp = await fetch('/api/calibrate_badge', { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok && data.success) {
+      alert(`✅ ${data.message}`);
+    } else {
+      alert(`⚠️ ID Card notice: ${data.detail || data.message || 'Hold badge in ID Scan Zone'}`);
+    }
+  } catch (err) {
+    alert('❌ Network error during badge lock. Check server.');
   } finally {
     btn.disabled = false;
     btn.innerHTML = originalHtml;

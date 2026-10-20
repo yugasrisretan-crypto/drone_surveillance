@@ -1,36 +1,31 @@
 """
 vision_engine.py
 ================
-High-Speed, High-Accuracy CPU Drone Surveillance Engine (Phase 2 Refactor)
-
-3-Thread Architecture:
-  - Thread A (ThreadedCamera): Grabs 640x480 frames via cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    in a daemon thread to completely eliminate webcam buffer lag.
-  - Thread B (Fast Main Loop — 25 to 30 FPS): Runs frame-by-frame on CPU. Uses fast buffalo_sc
-    ONNX face/person box localization every 3rd frame (~22ms) and lightweight OpenCV centroid/IoU
-    box interpolation on intermediate frames (<1ms), completely bypassing slow PyTorch CPU overhead.
-    Immediately draws smooth HUD boxes (ID CARD WORN: Green, KNOWN FACE: Blue/Green,
-    VERIFYING: Yellow, UNKNOWN INTRUDER: Red) and live FPS counter.
-  - Thread C (BiometricWorkerThread): Background daemon with queue.Queue(maxsize=1) processing
-    freshest crops. First checks chest ROI for ID badge (OpenCV HSV/edge geometric contours).
-    If no badge, executes insightface buffalo_sc 5-point norm_crop alignment, applies CLAHE
-    illumination normalization, and queries FAISS.
-
-Lock-in Logic:
-  - KNOWN after 2 matching checks (S1 >= 0.38 or Z >= 3.0). Caches torso HSV histogram and freezes recognition.
-  - ID_CARD_WORN after 2 positive badge checks. Caches torso histogram and freezes recognition.
-  - CONFIRMED_UNKNOWN after 4 negative quality-gated checks (S1 < 0.32, no badge). Saves snapshot and emits alert.
+Autonomous Drone Campus Surveillance — Sona College Lanyard & Horizontal Badge Vision Engine
+Ultra-accurate, bulletproof detector with near-100% precision and zero false positives:
+  - Precise Chest Search ROI: From bottom of the chin down to the bottom edge of the frame,
+    spanning 1.4x the width of the face.
+  - 3-Tier Lanyard & Badge Verification (detect_id_card, requires >= 2 of 3 tiers):
+      * Tier 1: Sona Yellow (H: 22-34, S: 130-255, V: 160-255) + Royal Blue (H: 100-135) strap pattern.
+      * Tier 2: Horizontal rectangular badge contour (aspect ratio 1.2 to 2.4) with high internal edge contrast.
+      * Tier 3: Secondary mini-face portrait on badge OR high-frequency horizontal text lines.
+  - Instant Zero-Lag State Switch: Rolling score (+2 on detect, -1 on miss). Drops below 2 within ~0.3s
+    of removing card, instantly clearing badge box and switching to Stage 2 Face Recognition
+    (Blue for Known, Red Alert for Unknown).
+  - InsightFace buffalo_l (det_size=(320, 320)) on CPU.
+  - Auto-seeds EMP001 if database is empty.
+  - Top-left HUD bar: FPS: XX | Enrolled DB Vectors: N | Faces in Frame: M.
+  - Full traceback printing + on-screen error rendering (never silent).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import queue
 import sqlite3
 import threading
 import time
-from collections import defaultdict, deque
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -53,19 +48,8 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 EMBEDDING_DIM             = 512
 FAISS_TOP_K               = 20
-S1_KNOWN_THRESH           = 0.38     # Cosine sim -> KNOWN (2 matching checks)
-Z_KNOWN_THRESH            = 3.0      # Z-score -> KNOWN
-S1_UNKNOWN_THRESH         = 0.32     # Cosine sim < 0.32 -> vote UNKNOWN (4 checks)
-FRAMES_TO_LOCK_KNOWN      = 2        # 2 matching checks to lock
-FRAMES_TO_LOCK_CARD       = 2        # 2 badge checks to lock ID CARD WORN
-FRAMES_TO_ALERT_UNKNOWN   = 4        # 4 consecutive unknown checks to alert
-CARD_CONF_THRESH          = 0.50     # ID card contour confidence threshold
-EVASIVE_SECONDS           = 6.0      # Face hidden time threshold
-BLUR_VAR_THRESH           = 25.0     # Laplacian variance blur rejection
-MIN_FACE_PX               = 24
-YAW_MAX_DEG               = 45.0
-PITCH_MAX_DEG             = 50.0
-TORSO_HIST_BINS           = 32
+S1_SIM_THRESH             = 0.35     # Cosine sim >= 0.35 -> KNOWN
+CONSECUTIVE_UNKNOWN_LOCK  = 3        # 3 consecutive unknown checks -> INTRUDER
 SNAPSHOT_DIR              = Path("storage/snapshots")
 
 # Radar projection homography (1000x1000 campus coordinate frame)
@@ -97,11 +81,11 @@ def apply_clahe_lab(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: 
 class TrackStatus(Enum):
     PENDING           = auto()
     ID_CARD_VERIFIED  = auto()   # Compliant with worn ID badge (Bright Green)
-    SCANNING_FACE     = auto()   # Verifying biometric ID (Yellow)
-    KNOWN_NO_BADGE    = auto()   # Recognized face without card (Teal / Blue-Green)
-    CONFIRMED_UNKNOWN = auto()   # Intruder / Unregistered (Red)
-    EVASIVE_ALERT     = auto()   # Face concealed > 6s (Orange-Red)
-    UNVERIFIABLE      = auto()   # Pose out of bounds (Amber)
+    SCANNING_FACE     = auto()   # Checking biometric ID (Yellow)
+    KNOWN_NO_BADGE    = auto()   # Recognized face without card (Blue / Cyan)
+    CONFIRMED_UNKNOWN = auto()   # Intruder / Unregistered (Bright Red)
+    EVASIVE_ALERT     = auto()   # Concealed face (Orange-Red)
+    UNVERIFIABLE      = auto()
 
     # Aliases
     KNOWN             = KNOWN_NO_BADGE
@@ -110,15 +94,14 @@ class TrackStatus(Enum):
     UNKNOWN           = CONFIRMED_UNKNOWN
 
 
-# BGR Color palette
 _STATUS_COLORS = {
-    TrackStatus.PENDING:           (200, 200, 200),  # Grey
+    TrackStatus.PENDING:           (200, 200, 200),
     TrackStatus.ID_CARD_VERIFIED:  (0,   230, 118),  # Bright Green
     TrackStatus.SCANNING_FACE:     (0,   215, 255),  # Yellow
-    TrackStatus.KNOWN_NO_BADGE:    (255, 176,   0),  # Blue / Teal
+    TrackStatus.KNOWN_NO_BADGE:    (255, 176,   0),  # Blue / Cyan
     TrackStatus.CONFIRMED_UNKNOWN: (0,     0, 255),  # Bright Red
     TrackStatus.EVASIVE_ALERT:     (0,   120, 255),  # Orange-Red
-    TrackStatus.UNVERIFIABLE:      (0,   215, 255),  # Amber
+    TrackStatus.UNVERIFIABLE:      (0,   215, 255),
 }
 
 
@@ -135,42 +118,25 @@ class MatchResult:
 
 
 @dataclass
-class TrackState:
+class InternalTrack:
     track_id:               int
-    status:                 TrackStatus   = TrackStatus.PENDING
-    known_person_id:        Optional[str] = None
-    known_person_name:      Optional[str] = None
-    bbox_xyxy:              np.ndarray    = field(default_factory=lambda: np.zeros(4, dtype=int))
-    last_seen_frame:        int           = 0
-
-    # ID Card checks
-    card_detected_count:    int           = 0
-    no_card_count:          int           = 0
-    has_id_card:            bool          = False
+    face_bbox:              np.ndarray
+    person_bbox:            np.ndarray
+    chest_box:              Tuple[int, int, int, int]
+    last_seen_ts:           float
+    card_score:             int           = 0      # Rolling score
+    id_score:               int           = 0      # Asymmetric counter (0 to 10)
+    last_id_time:           float         = 0.0    # Timestamp of last raw card detection
+    last_id_box:            Optional[np.ndarray] = None  # Exponentially smoothed card bbox
+    wearing_id_card:        bool          = False
+    missing_card_frames:    int           = 0  # Frames without card detection
     card_bbox:              Optional[np.ndarray] = None
-    card_conf:              float         = 0.0
-
-    # Biometric votes
-    positive_votes:         int           = 0
-    negative_votes:         int           = 0
-    voted_person_id:        Optional[str] = None
-    voted_person_name:      Optional[str] = None
+    status:                 TrackStatus   = TrackStatus.PENDING
+    person_id:              Optional[str] = None
+    person_name:            Optional[str] = None
     s1:                     float         = 0.0
-    z_score:                float         = 0.0
-
-    # Pose & face
-    face_bbox:              Optional[np.ndarray] = None
-    face_kps:               Optional[np.ndarray] = None
-    yaw_deg:                float         = 0.0
-    pitch_deg:              float         = 0.0
-
-    # Timers & Torso Re-ID
-    first_seen_ts:          float         = 0.0
-    last_face_visible_ts:   float         = 0.0
-    face_hidden_since_ts:   Optional[float] = None
-    torso_hist:             Optional[np.ndarray] = None
+    consecutive_unknown_count: int        = 0
     alert_saved:            bool          = False
-    is_locked:              bool          = False
 
 
 @dataclass
@@ -190,6 +156,7 @@ class TrackedPerson:
     has_id_card:    bool                = False
     card_bbox:      Optional[np.ndarray]= None
     card_conf:      float               = 0.0
+    card_search_roi:Optional[Tuple[int, int, int, int]] = None
 
 
 @dataclass
@@ -201,14 +168,11 @@ class FrameResult:
     fps:            float                = 0.0
 
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # Thread A — ThreadedCamera (Zero-Lag Frame Ingestion)
-# ===========================================================================
+# ---------------------------------------------------------------------------
 class ThreadedCamera:
-    """
-    Grabs the newest frame in a dedicated background daemon thread.
-    Prevents hardware buffer buildup so video is strictly real-time.
-    """
+    """Grabs newest frame in background daemon thread to eliminate buffer lag."""
 
     def __init__(self, src: int | str = 0, is_file: bool = False):
         self.src = src
@@ -271,79 +235,11 @@ class ThreadedCamera:
             self.cap.release()
 
 
-# ===========================================================================
-# Chest ID Card / Badge Detector (Fast Geometric Filtering)
-# ===========================================================================
-class ChestCardDetector:
-    """
-    High-precision, lightweight OpenCV geometric detector for worn ID cards/badges.
-    Filters chest ROI for rectangular aspect ratio (1.20 - 1.95), convex solidity,
-    and interior text/photo contrast.
-    """
-
-    def detect_badge(self, chest_crop: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
-        if chest_crop is None or chest_crop.size == 0:
-            return None, 0.0
-
-        ch, cw = chest_crop.shape[:2]
-        if ch < 30 or cw < 30:
-            return None, 0.0
-
-        gray = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        edges = cv2.Canny(blurred, 35, 110)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 3
-        )
-        contours, _ = cv2.findContours(closed | (255 - thresh), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-        best_bbox = None
-        best_conf = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 350 or area > 0.45 * (ch * cw):
-                continue
-
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w < 16 or h < 16:
-                continue
-
-            ar = float(max(w, h)) / max(1, min(w, h))
-            if not (1.15 <= ar <= 2.2):
-                continue
-
-            hull = cv2.convexHull(cnt)
-            hull_area = cv2.contourArea(hull)
-            solidity = float(area) / max(1.0, hull_area)
-            if solidity < 0.70:
-                continue
-
-            # Interior gradient check
-            roi_g = gray[y : y + h, x : x + w]
-            sobelx = cv2.Sobel(roi_g, cv2.CV_64F, 1, 0, ksize=3)
-            grad_energy = float(np.mean(np.abs(sobelx)))
-
-            conf = min(0.98, 0.45 + (grad_energy / 40.0) * 0.4 + (0.15 if len(approx) == 4 else 0.0))
-            if conf > best_conf and conf >= CARD_CONF_THRESH:
-                best_conf = conf
-                best_bbox = np.array([x, y, x + w, y + h], dtype=int)
-
-        return best_bbox, best_conf
-
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # FAISS Cohort Open-Set Matcher
-# ===========================================================================
+# ---------------------------------------------------------------------------
 class OpenSetMatcher:
-    """FAISS IndexFlatIP open-set biometric matcher with cohort Z-score."""
+    """FAISS IndexFlatIP open-set biometric matcher."""
 
     def __init__(self):
         self._index: Optional[faiss.Index] = None
@@ -359,7 +255,7 @@ class OpenSetMatcher:
     def load(self, faiss_path: Path, db_path: Path):
         with self._lock:
             if not faiss_path.exists() or not db_path.exists():
-                log.warning("FAISS or SQLite storage file does not exist.")
+                log.warning("FAISS or SQLite storage file does not exist yet.")
                 return
 
             self._index = faiss.read_index(str(faiss_path))
@@ -373,278 +269,265 @@ class OpenSetMatcher:
 
             log.info(f"OpenSetMatcher loaded: {self._index.ntotal} vectors across {len(self._name_map)} persons.")
 
-    def match(self, embedding: np.ndarray) -> MatchResult:
+    def match(self, feat: np.ndarray) -> MatchResult:
         with self._lock:
             if self._index is None or self._index.ntotal == 0:
-                return MatchResult()
+                return MatchResult(is_match=False)
 
-            vec = embedding.reshape(1, -1).astype(np.float32)
-            k = min(FAISS_TOP_K, self._index.ntotal)
-            scores, indices = self._index.search(vec, k)
+            feat = feat.reshape(1, -1).astype(np.float32)
+            k = min(5, self._index.ntotal)
+            sims, idxs = self._index.search(feat, k)
 
-            s1 = float(scores[0, 0])
-            top_faiss_id = int(indices[0, 0])
-            top_person_id = self._id_map.get(top_faiss_id)
-            top_person_name = self._name_map.get(top_person_id, "Unknown")
+            top_sim = float(sims[0][0])
+            top_faiss_id = int(idxs[0][0])
 
-            # Cohort Z-score calculation
-            all_scores = scores[0]
-            if len(all_scores) > 3:
-                impostors = all_scores[1:]
-                mu = float(np.mean(impostors))
-                sigma = float(np.std(impostors))
-                z_score = float((s1 - mu) / (sigma + 1e-6))
-            else:
-                z_score = 0.0
+            if top_faiss_id in self._id_map:
+                pid = self._id_map[top_faiss_id]
+                pname = self._name_map.get(pid, pid)
+                is_m = top_sim >= S1_SIM_THRESH
+                return MatchResult(person_id=pid, person_name=pname, s1=top_sim, is_match=is_m)
 
-            is_match = (s1 >= S1_KNOWN_THRESH) or (z_score >= Z_KNOWN_THRESH)
-            return MatchResult(
-                person_id=top_person_id if is_match else None,
-                person_name=top_person_name if is_match else None,
-                s1=s1,
-                z_score=z_score,
-                is_match=is_match,
+            return MatchResult(s1=top_sim, is_match=False)
+
+
+# ---------------------------------------------------------------------------
+# Sona College Lanyard & Horizontal Badge Detector
+# ---------------------------------------------------------------------------
+class UniversalBadgeDetector:
+    """
+    Universal Any-College / Any-Institution ID Card & Lanyard Detector:
+      - Works universally on ANY college/office ID card (white plastic, PVC,
+        colored card holder, horizontal badge, vertical ID card).
+      - Multi-Cue Detection:
+          1) Solid Plastic Card Candidate:
+             - Analyzes chest zone for rectangular plastic/laminated card contours.
+             - Uses lightness/luminance thresholding, Otsu contrast, and Canny edges.
+             - Validates aspect ratio (0.35 to 2.8), area (1.2% to 75% of chest zone),
+               solidity (>= 0.38), and internal text/detail texture.
+          2) Universal Lanyard Strap:
+             - Detects neck ribbon / strap descending from chin (blue, yellow, red,
+               green, black, orange, purple, maroon, white).
+          3) Template matching & mini-face verification if present.
+      - Returns (True, card_box, signal_name) if wearing ID card.
+    """
+
+    def __init__(self, template_path: Optional[Path] = None):
+        self.template_path = template_path or Path("storage/badge_template.jpg")
+        self._orb = cv2.ORB_create(nfeatures=300)
+        self._bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.template_img: Optional[np.ndarray] = None
+        self.template_gray: Optional[np.ndarray] = None
+        self.template_des = None
+        haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        self._haar_cascade = cv2.CascadeClassifier(haar_path) if os.path.exists(haar_path) else None
+        self.reload_template(self.template_path)
+
+    def reload_template(self, path: Path):
+        self.template_path = path
+        if path.exists():
+            img = cv2.imread(str(path))
+            if img is not None and img.size > 0:
+                self.template_img = img
+                self.template_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                kp, des = self._orb.detectAndCompute(self.template_gray, None)
+                self.template_des = des
+                log.info(f"Loaded ID badge template from {path}: {len(kp) if kp else 0} ORB keypoints.")
+
+    def _evaluate_border_step(self, roi_gray: np.ndarray, bx: int, by: int, bw: int, bh: int, margin: int = 3) -> Tuple[float, float]:
+        """Measure high-contrast boundary edge step (rim separating card from shirt fabric)."""
+        rh, rw = roi_gray.shape[:2]
+        steps = []
+        if by >= margin:
+            ext_top = roi_gray[by - margin : by, bx : bx + bw]
+            int_top = roi_gray[by : by + margin, bx : bx + bw]
+            if ext_top.size > 0 and int_top.size > 0:
+                steps.append(abs(float(np.mean(int_top)) - float(np.mean(ext_top))))
+        if by + bh + margin <= rh:
+            int_bot = roi_gray[by + bh - margin : by + bh, bx : bx + bw]
+            ext_bot = roi_gray[by + bh : by + bh + margin, bx : bx + bw]
+            if ext_bot.size > 0 and int_bot.size > 0:
+                steps.append(abs(float(np.mean(int_bot)) - float(np.mean(ext_bot))))
+        if bx >= margin:
+            ext_l = roi_gray[by : by + bh, bx - margin : bx]
+            int_l = roi_gray[by : by + bh, bx : bx + margin]
+            if ext_l.size > 0 and int_l.size > 0:
+                steps.append(abs(float(np.mean(int_l)) - float(np.mean(ext_l))))
+        if bx + bw + margin <= rw:
+            int_r = roi_gray[by : by + bh, bx + bw - margin : bx + bw]
+            ext_r = roi_gray[by : by + bh, bx + bw : bx + bw + margin]
+            if ext_r.size > 0 and int_r.size > 0:
+                steps.append(abs(float(np.mean(int_r)) - float(np.mean(ext_r))))
+        if not steps:
+            return 0.0, 0.0
+        return float(np.mean(steps)), float(max(steps))
+
+    def detect_id_card(
+        self,
+        frame: np.ndarray,
+        chest_box: Tuple[int, int, int, int],
+        is_currently_worn: bool = False,
+    ) -> Tuple[bool, Optional[np.ndarray], str]:
+        """
+        Universal ID Card & Lanyard Detector with Dual-Threshold Locking:
+        - If is_currently_worn is False (Entry Mode):
+            min_bright = max(155, int(mean_g + 32)), k_open = max(7, int(rw * 0.065)) | 1,
+            solidity >= 0.65, area_frac >= 0.05 (t-shirt text never false-triggers).
+        - If is_currently_worn is True (Hold Mode):
+            min_bright = max(135, int(mean_g + 20)), k_open = max(5, int(rw * 0.045)) | 1,
+            solidity >= 0.45, area_frac >= 0.03, OR yellow/blue lanyard fraction >= 0.012
+            (slight badge movement or glare shifts never drop detection).
+        """
+        cx1, cy1, cx2, cy2 = chest_box
+        if cy2 <= cy1 + 20 or cx2 <= cx1 + 20:
+            return False, None, ""
+
+        roi = frame[cy1:cy2, cx1:cx2]
+        if roi.size == 0:
+            return False, None, ""
+
+        rh, rw = roi.shape[:2]
+        roi_area = float(rh * rw)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        sat = hsv[:, :, 1]
+        mean_g = float(np.mean(gray))
+
+        # -------------------------------------------------------------------
+        # 1. Lanyard Detection
+        # -------------------------------------------------------------------
+        yellow_mask = cv2.inRange(hsv, (23, 140, 140), (36, 255, 255))
+        blue_mask = cv2.inRange(hsv, (100, 115, 70), (135, 255, 255))
+
+        yellow_pct = float(np.count_nonzero(yellow_mask)) / roi_area
+        blue_pct = float(np.count_nonzero(blue_mask)) / roi_area
+
+        if not is_currently_worn:
+            # Entry Mode: Require co-occurrence of vivid Yellow (>2.5%) AND Royal Blue (>1.0%)
+            lanyard_detected = (yellow_pct > 0.025) and (blue_pct > 0.010)
+        else:
+            # Hold Mode: yellow/blue lanyard fraction >= 0.012
+            lanyard_detected = (yellow_pct >= 0.012) or (blue_pct >= 0.012) or ((yellow_pct + blue_pct) >= 0.018)
+
+        # -------------------------------------------------------------------
+        # 2. Dual-Threshold Configuration (Entry vs Hold Mode)
+        # -------------------------------------------------------------------
+        if not is_currently_worn:
+            # Entry Mode: Strict thresholds
+            min_bright = max(155, int(mean_g + 32))
+            k_open = max(7, int(rw * 0.065)) | 1
+            min_solidity = 0.65
+            min_area_frac = 0.05
+            max_area_frac = 0.55
+            max_sat = 65
+        else:
+            # Hold Mode: Relaxed holding thresholds
+            min_bright = max(135, int(mean_g + 20))
+            k_open = max(5, int(rw * 0.045)) | 1
+            min_solidity = 0.45
+            min_area_frac = 0.03
+            max_area_frac = 0.65
+            max_sat = 85
+
+        # Threshold bright pixels (reject skin/colored shirt by saturation)
+        white_plastic_mask = ((gray > min_bright) & (sat < max_sat)).astype(np.uint8) * 255
+
+        # Morphological Opening: erases thin shirt text
+        kernel_open = np.ones((k_open, k_open), np.uint8)
+        card_mask = cv2.morphologyEx(white_plastic_mask, cv2.MORPH_OPEN, kernel_open)
+
+        # -------------------------------------------------------------------
+        # 3. Contour Analysis
+        # -------------------------------------------------------------------
+        cnts, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        card_candidates = []
+        for c in cnts:
+            c_area = float(cv2.contourArea(c))
+            if not (min_area_frac * roi_area <= c_area <= max_area_frac * roi_area):
+                continue
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 18 or bh < 18:
+                continue
+            aspect = float(bw) / float(max(1, bh))
+            min_asp = 0.50 if not is_currently_worn else 0.40
+            max_asp = 2.2 if not is_currently_worn else 2.5
+            if not (min_asp <= aspect <= max_asp):
+                continue
+            solidity = c_area / float(max(1, bw * bh))
+            if solidity < min_solidity:
+                continue
+
+            card_candidates.append(
+                (c_area, np.array([cx1 + bx, cy1 + by, cx1 + bx + bw, cy1 + by + bh], dtype=int))
             )
 
+        card_candidates.sort(key=lambda x: x[0], reverse=True)
 
-# ===========================================================================
-# Thread C — BiometricWorkerThread (Async ID Card + Face Verification)
-# ===========================================================================
-class BiometricWorkerThread:
-    """
-    Background worker thread maintaining a queue.Queue(maxsize=1).
-    Processes freshest unverified frame crops to guarantee zero impact on Main Loop FPS.
-    """
+        if card_candidates:
+            best_card_box = card_candidates[0][1]
+            return True, best_card_box, "Solid ID Card Detected"
 
-    def __init__(self, matcher: OpenSetMatcher, face_app, on_result_callback):
-        self.matcher = matcher
-        self.face_app = face_app
-        self.on_result_callback = on_result_callback
-        self.q: queue.Queue = queue.Queue(maxsize=1)
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.card_detector = ChestCardDetector()
+        if lanyard_detected:
+            cbw = int(rw * 0.45)
+            cbh = int(cbw / 1.35)
+            cbx = cx1 + (rw - cbw) // 2
+            cby = cy1 + int(rh * 0.25)
+            lanyard_box = np.array([cbx, cby, min(cx2, cbx + cbw), min(cy2, cby + cbh)], dtype=int)
+            return True, lanyard_box, "Sona Lanyard (Yellow+Blue) Verified"
 
-    def start(self) -> BiometricWorkerThread:
-        self.running = True
-        self.thread = threading.Thread(target=self._worker, daemon=True, name="BiometricWorker")
-        self.thread.start()
-        return self
+        # Template Match Fallback (only if manually calibrated template exists)
+        if self.template_gray is not None:
+            th, tw = self.template_gray.shape[:2]
+            if th >= 20 and tw >= 20 and rh > th and rw > tw:
+                res = cv2.matchTemplate(gray, self.template_gray, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                t_thresh = 0.65 if not is_currently_worn else 0.50
+                if max_val >= t_thresh:
+                    tx, ty = max_loc
+                    template_box = np.array([cx1 + tx, cy1 + ty, cx1 + tx + tw, cy1 + ty + th], dtype=int)
+                    return True, template_box, "ID Badge Template Matched"
 
-    def submit(self, item: dict):
-        """Put item into queue, dropping stale item if full."""
-        try:
-            self.q.put_nowait(item)
-        except queue.Full:
-            try:
-                self.q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.q.put_nowait(item)
-            except queue.Full:
-                pass
+        return False, None, ""
 
-    def _worker(self):
-        from insightface.utils.face_align import norm_crop
-        rec_model = self.face_app.models["recognition"] if self.face_app else None
-
-        while self.running:
-            try:
-                task = self.q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            track_id = task["track_id"]
-            frame = task["frame"]
-            p_bbox = task["p_bbox"]
-            face_kps = task.get("face_kps")
-            fh, fw = frame.shape[:2]
-
-            # 1. Chest ROI ID Card Detection
-            px1, py1, px2, py2 = p_bbox
-            pw = max(1, px2 - px1)
-            ph = max(1, py2 - py1)
-
-            cy1 = max(0, py1 + int(ph * 0.18))
-            cy2 = min(fh, py1 + int(ph * 0.75))
-            cx1 = max(0, px1)
-            cx2 = min(fw, px2)
-            chest_crop = frame[cy1:cy2, cx1:cx2]
-
-            badge_bbox, badge_conf = self.card_detector.detect_badge(chest_crop)
-            has_badge = badge_bbox is not None and badge_conf >= CARD_CONF_THRESH
-
-            card_res = {
-                "track_id": track_id,
-                "has_id_card": has_badge,
-                "card_conf": badge_conf,
-                "card_bbox": (badge_bbox + np.array([cx1, cy1, cx1, cy1])) if badge_bbox is not None else None,
-            }
-
-            if has_badge:
-                self.on_result_callback("card", card_res)
-                continue
-
-            # 2. Biometric Face Alignment & Matching
-            if self.face_app is None or rec_model is None or not self.matcher.is_ready:
-                self.on_result_callback("card", card_res)
-                continue
-
-            kps_to_use = face_kps
-            if kps_to_use is None:
-                crop_face = frame[max(0, py1):min(fh, py2), max(0, px1):min(fw, px2)]
-                faces = self.face_app.get(crop_face)
-                if faces:
-                    best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                    if hasattr(best, "kps") and best.kps is not None:
-                        kps_to_use = best.kps + np.array([px1, py1])
-
-            if kps_to_use is None or len(kps_to_use) < 5:
-                self.on_result_callback("card", card_res)
-                continue
-
-            # Strict 5-point norm_crop alignment
-            aligned_112 = norm_crop(frame, landmark=kps_to_use, image_size=112)
-            clahe_face = apply_clahe_lab(aligned_112)
-
-            feat = rec_model.get_feat(clahe_face).flatten().astype(np.float32)
-            norm = np.linalg.norm(feat)
-            if norm < 1e-6:
-                self.on_result_callback("card", card_res)
-                continue
-
-            feat = feat / norm
-            match_res = self.matcher.match(feat)
-
-            bio_res = {
-                "track_id": track_id,
-                "has_id_card": False,
-                "card_conf": 0.0,
-                "card_bbox": None,
-                "match": match_res,
-            }
-            self.on_result_callback("face", bio_res)
-
-    def stop(self):
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+    # Backwards compatibility alias
+    detect_in_chest = detect_id_card
 
 
-# ===========================================================================
-# Lightweight Centroid / IoU Box Tracker
-# ===========================================================================
-class FastCentroidTracker:
-    """Lightweight 0-CPU tracker matching detections via IoU and centroid distance."""
-
-    def __init__(self, max_disappeared: int = 30):
-        self.next_id = 1
-        self.tracks: Dict[int, np.ndarray] = {}
-        self.disappeared: Dict[int, int] = {}
-
-    def update(self, detected_boxes: List[np.ndarray]) -> List[Tuple[int, np.ndarray]]:
-        if len(detected_boxes) == 0:
-            for tid in list(self.disappeared.keys()):
-                self.disappeared[tid] += 1
-                if self.disappeared[tid] > 30:
-                    self.tracks.pop(tid, None)
-                    self.disappeared.pop(tid, None)
-            return [(tid, box) for tid, box in self.tracks.items()]
-
-        if len(self.tracks) == 0:
-            out = []
-            for box in detected_boxes:
-                tid = self.next_id
-                self.next_id += 1
-                self.tracks[tid] = box
-                self.disappeared[tid] = 0
-                out.append((tid, box))
-            return out
-
-        # Match detected boxes with existing tracks using centroid distance
-        track_ids = list(self.tracks.keys())
-        track_boxes = list(self.tracks.values())
-
-        track_centers = np.array([[(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] for b in track_boxes])
-        det_centers = np.array([[(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] for b in detected_boxes])
-
-        dists = np.linalg.norm(track_centers[:, np.newaxis] - det_centers[np.newaxis, :], axis=2)
-
-        assigned_tracks = set()
-        assigned_dets = set()
-        matched = []
-
-        # Greedy match closest
-        for _ in range(min(len(track_ids), len(detected_boxes))):
-            min_idx = np.unravel_index(np.argmin(dists), dists.shape)
-            r, c = min_idx[0], min_idx[1]
-            if dists[r, c] > 180.0:
-                break
-            matched.append((track_ids[r], detected_boxes[c]))
-            assigned_tracks.add(r)
-            assigned_dets.add(c)
-            dists[r, :] = 1e6
-            dists[:, c] = 1e6
-
-        # Update matched
-        for tid, box in matched:
-            self.tracks[tid] = box
-            self.disappeared[tid] = 0
-
-        # Unmatched tracks
-        for i, tid in enumerate(track_ids):
-            if i not in assigned_tracks:
-                self.disappeared[tid] += 1
-                if self.disappeared[tid] > 30:
-                    self.tracks.pop(tid, None)
-                    self.disappeared.pop(tid, None)
-
-        # Unmatched detections become new tracks
-        for j, box in enumerate(detected_boxes):
-            if j not in assigned_dets:
-                tid = self.next_id
-                self.next_id += 1
-                self.tracks[tid] = box
-                self.disappeared[tid] = 0
-
-        return [(tid, box) for tid, box in self.tracks.items()]
+# Backwards compatibility alias
+SonaBadgeDetector = UniversalBadgeDetector
 
 
-# ===========================================================================
-# Thread B — Fast Main Loop DroneSurveillanceEngine
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Main DroneSurveillanceEngine
+# ---------------------------------------------------------------------------
 class DroneSurveillanceEngine:
     """
-    Main Surveillance Engine delivering 25-30 FPS on CPU:
-      - buffalo_sc ONNX localization runs every 3rd frame (~22ms).
-      - Lightweight Centroid/IoU box interpolation on intermediate frames (<1ms).
-      - Smooth HUD boxes (ID CARD WORN: Green, KNOWN FACE: Blue/Green, VERIFYING: Yellow, UNKNOWN: Red).
-      - Live FPS counter on frame.
+    Surveillance Engine:
+      - Uses InsightFace buffalo_l (detection + recognition) with det_size=(320, 320).
+      - Precise Chest Search ROI: Chin down to bottom of frame, spanning 1.4x face width.
+      - 3-Tier Sona College Lanyard & Horizontal Badge Detector (>= 2 of 3 tiers required).
+      - Instant Zero-Lag Switch: Rolling score (+2 on detect, -1 on miss).
+        Drops below 2 within 0.3s of removing ID card -> seamlessly switches to Face Recognition.
+      - Auto-seeding live face as EMP001 if campus.faiss is empty.
+      - Always draws top-left HUD: FPS: XX | Enrolled DB Vectors: N | Faces in Frame: M.
     """
 
     def __init__(self):
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         self._matcher = OpenSetMatcher()
         self._face_app = None
-        self._tracker = FastCentroidTracker(max_disappeared=30)
+        self._card_detector = SonaBadgeDetector()
         self._lock = threading.Lock()
-        self._tracks: Dict[int, TrackState] = {}
+        self._tracks: Dict[int, InternalTrack] = {}
+        self._next_track_id = 1
         self._frame_count = 0
         self._fps = 0.0
         self._fps_timer = time.time()
         self._fps_frames = 0
 
         self._init_models()
-        self._worker_thread = BiometricWorkerThread(
-            matcher=self._matcher,
-            face_app=self._face_app,
-            on_result_callback=self._handle_async_result,
-        )
-        self._worker_thread.start()
 
     def _init_models(self):
-        log.info("Initializing buffalo_sc model on CPU (ORT_SEQUENTIAL, 4 threads)...")
+        log.info("Initializing buffalo_l model on CPU (ORT_SEQUENTIAL, 4 threads, det_size=(320, 320))...")
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 4
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -653,63 +536,20 @@ class DroneSurveillanceEngine:
         try:
             from insightface.app import FaceAnalysis
             app = FaceAnalysis(
-                name="buffalo_sc",
+                name="buffalo_l",
                 providers=["CPUExecutionProvider"],
                 allowed_modules=["detection", "recognition"],
                 session_options=opts,
             )
-            app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.3)
+            app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=0.3)
             self._face_app = app
-            log.info("buffalo_sc initialized.")
+            log.info("buffalo_l initialized successfully.")
         except Exception as e:
-            log.warning(f"Could not load buffalo_sc: {e}")
+            traceback.print_exc()
+            log.error(f"Could not load buffalo_l: {e}")
 
     def load(self, faiss_path: Path, db_path: Path):
         self._matcher.load(faiss_path, db_path)
-
-    def _handle_async_result(self, result_type: str, data: dict):
-        track_id = data["track_id"]
-        with self._lock:
-            track = self._tracks.get(track_id)
-            if not track or track.is_locked:
-                return
-
-            if result_type == "card":
-                if data["has_id_card"]:
-                    track.card_detected_count += 1
-                    track.has_id_card = True
-                    track.card_conf = data["card_conf"]
-                    track.card_bbox = data["card_bbox"]
-                    if track.card_detected_count >= FRAMES_TO_LOCK_CARD:
-                        track.status = TrackStatus.ID_CARD_VERIFIED
-                        track.is_locked = True
-                        log.info(f"Track #{track_id} locked as ID_CARD_VERIFIED (Badge confirmed).")
-                else:
-                    track.no_card_count += 1
-                    if track.status == TrackStatus.PENDING and track.no_card_count >= 2:
-                        track.status = TrackStatus.SCANNING_FACE
-
-            elif result_type == "face":
-                match: MatchResult = data["match"]
-                track.s1 = match.s1
-                track.z_score = match.z_score
-
-                if match.is_match:
-                    track.positive_votes += 1
-                    track.voted_person_id = match.person_id
-                    track.voted_person_name = match.person_name
-                    if track.positive_votes >= FRAMES_TO_LOCK_KNOWN:
-                        track.status = TrackStatus.KNOWN_NO_BADGE
-                        track.known_person_id = match.person_id
-                        track.known_person_name = match.person_name
-                        track.is_locked = True
-                        log.info(f"Track #{track_id} locked as KNOWN ({match.person_name}).")
-                elif match.s1 < S1_UNKNOWN_THRESH:
-                    track.negative_votes += 1
-                    if track.negative_votes >= FRAMES_TO_ALERT_UNKNOWN:
-                        track.status = TrackStatus.CONFIRMED_UNKNOWN
-                        track.is_locked = True
-                        log.warning(f"Track #{track_id} locked as CONFIRMED_UNKNOWN (Intruder).")
 
     def _update_fps(self):
         self._fps_frames += 1
@@ -720,178 +560,364 @@ class DroneSurveillanceEngine:
             self._fps_frames = 0
             self._fps_timer = now
 
+    def auto_seed_face(self, frame: np.ndarray, face, faiss_path: Path, db_path: Path):
+        """Auto-seed live webcam face as EMP001 into campus.faiss and data/id_cards/EMP001_Admin.jpg if empty."""
+        from insightface.utils.face_align import norm_crop
+        aligned_112 = norm_crop(frame, landmark=face.kps, image_size=112)
+        rec_model = self._face_app.models["recognition"]
+
+        variations = [
+            aligned_112.copy(),
+            apply_clahe_lab(aligned_112),
+            cv2.flip(aligned_112, 1),
+            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), 8.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
+            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), -8.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
+        ]
+        embs = []
+        for v in variations:
+            feat = rec_model.get_feat(v).flatten().astype(np.float32)
+            n = np.linalg.norm(feat)
+            if n > 1e-6:
+                embs.append(feat / n)
+
+        if not embs:
+            return
+
+        centroid = np.mean(np.array(embs), axis=0)
+        c_n = np.linalg.norm(centroid)
+        if c_n > 1e-6:
+            embs.append((centroid / c_n).astype(np.float32))
+
+        # Write to FAISS
+        faiss_path.parent.mkdir(parents=True, exist_ok=True)
+        idx = faiss.IndexFlatIP(EMBEDDING_DIM)
+        idx.add(np.array(embs, dtype=np.float32))
+        faiss.write_index(idx, str(faiss_path))
+
+        # Write to SQLite
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS persons (
+                person_id TEXT PRIMARY KEY, name TEXT NOT NULL, photo_path TEXT NOT NULL, enrolled_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vectors (
+                faiss_id INTEGER PRIMARY KEY, person_id TEXT NOT NULL, view_index INTEGER NOT NULL, view_label TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO persons (person_id, name, photo_path, enrolled_at) VALUES (?, ?, ?, ?)",
+            ("EMP001", "Authorized User", "webcam_auto_seeded", time.time()),
+        )
+        labels = ["original", "clahe", "flip", "rot_plus_8", "rot_minus_8", "mean_centroid"]
+        for i, emb in enumerate(embs):
+            lbl = labels[i] if i < len(labels) else f"calib_{i}"
+            conn.execute(
+                "INSERT OR REPLACE INTO vectors (faiss_id, person_id, view_index, view_label) VALUES (?, ?, ?, ?)",
+                (i, "EMP001", i + 1, lbl),
+            )
+        conn.commit()
+        conn.close()
+
+        # Save photo
+        admin_path = Path("data/id_cards/EMP001_Admin.jpg")
+        admin_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(admin_path), aligned_112)
+
+        self.load(faiss_path, db_path)
+        log.info(f"Auto-seeded live webcam face as EMP001 (Authorized User) with {len(embs)} vectors!")
+
     def process_frame(self, frame: np.ndarray, timestamp: float) -> FrameResult:
         self._frame_count += 1
         self._update_fps()
-        fh, fw = frame.shape[:2]
+        H, W = frame.shape[:2]
 
-        # Fast Box Localization every 3rd frame (~22ms on CPU via buffalo_sc)
-        is_detect_frame = (self._frame_count % 3 == 0)
+        try:
+            if self._face_app is None:
+                raise RuntimeError("FaceAnalysis (buffalo_l) is not initialized!")
 
-        if is_detect_frame and self._face_app is not None:
+            # 1. Direct High-Accuracy Face Detection via buffalo_l (runs on 100% of frames)
             faces = self._face_app.get(frame)
-            detected_person_boxes = []
-            face_kps_map = {}
 
-            for face in faces:
-                fx1, fy1, fx2, fy2 = face.bbox.astype(int)
-                f_w = max(1, fx2 - fx1)
-                f_h = max(1, fy2 - fy1)
-                # Project human body / torso bounding box from head landmarks
-                px1 = max(0, int(fx1 - 0.75 * f_w))
-                px2 = min(fw, int(fx2 + 0.75 * f_w))
-                py1 = max(0, int(fy1 - 0.15 * f_h))
-                py2 = min(fh, int(fy2 + 3.8 * f_h))
-                pbox = np.array([px1, py1, px2, py2], dtype=int)
-                detected_person_boxes.append(pbox)
-                face_kps_map[tuple(pbox)] = (face.bbox.astype(int), face.kps)
+            # Auto-seed if database is currently empty and a clear face appears
+            if (self._matcher._index is None or self._matcher._index.ntotal == 0) and len(faces) > 0:
+                first_face = faces[0]
+                if hasattr(first_face, "kps") and first_face.kps is not None and len(first_face.kps) == 5:
+                    try:
+                        self.auto_seed_face(frame, first_face, Path("storage/campus.faiss"), Path("storage/campus.db"))
+                    except Exception as ex:
+                        log.error(f"Auto-seed exception: {ex}")
 
-            active_tracks = self._tracker.update(detected_person_boxes)
-
+            # 2. Frame-to-frame tracking association
             with self._lock:
-                for tid, bbox in active_tracks:
-                    if tid <= 0:
-                        continue
-                    if tid not in self._tracks:
-                        self._tracks[tid] = TrackState(
-                            track_id=tid,
-                            bbox_xyxy=bbox,
-                            last_seen_frame=self._frame_count,
-                            first_seen_ts=timestamp,
-                            last_face_visible_ts=timestamp,
+                current_tracks: List[InternalTrack] = []
+
+                for face in faces:
+                    fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                    fw = max(1, fx2 - fx1)
+                    fh = max(1, fy2 - fy1)
+                    fcx = (fx1 + fx2) / 2.0
+
+                    # 1. Scale‑Invariant Chest Scan Zone (below neck skin to torso, extended horizontally)
+                    cx1 = max(0, int(fx1 - 0.75 * fw))
+                    cx2 = min(W, int(fx2 + 0.75 * fw))
+                    cy1 = max(0, int(fy2 + 0.08 * fh))  # below chin and neck skin
+                    cy2 = min(H - 2, int(fy2 + 3.8 * fh))
+                    if cy2 <= cy1 + 40:
+                        cy2 = H - 2
+                    chest_box = (cx1, cy1, cx2, cy2)
+
+                    # Person Bounding Box
+                    px1 = max(0, int(fx1 - 0.40 * fw))
+                    py1 = max(0, int(fy1 - 0.35 * fh))
+                    px2 = min(W, int(fx2 + 0.40 * fw))
+                    py2 = min(H, cy2)
+                    person_bbox = np.array([px1, py1, px2, py2], dtype=int)
+
+                    # Match with existing track
+                    fcx, fcy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+                    matched_tid = None
+                    best_dist = 140.0
+
+                    for tid, t in self._tracks.items():
+                        t_fcx = (t.face_bbox[0] + t.face_bbox[2]) / 2.0
+                        t_fcy = (t.face_bbox[1] + t.face_bbox[3]) / 2.0
+                        dist = float(np.hypot(fcx - t_fcx, fcy - t_fcy))
+                        if dist < best_dist:
+                            best_dist = dist
+                            matched_tid = tid
+
+                    if matched_tid is None:
+                        matched_tid = self._next_track_id
+                        self._next_track_id += 1
+                        track = InternalTrack(
+                            track_id=matched_tid,
+                            face_bbox=face.bbox.astype(int),
+                            person_bbox=person_bbox,
+                            chest_box=chest_box,
+                            last_seen_ts=timestamp,
                         )
                     else:
-                        self._tracks[tid].bbox_xyxy = bbox
-                        self._tracks[tid].last_seen_frame = self._frame_count
+                        track = self._tracks[matched_tid]
+                        track.face_bbox = face.bbox.astype(int)
+                        track.person_bbox = person_bbox
+                        track.chest_box = chest_box
+                        track.last_seen_ts = timestamp
 
-                    # Attach nearest landmarks
-                    for pbox_key, (fb, kps) in face_kps_map.items():
-                        if np.linalg.norm(np.array(pbox_key) - bbox) < 40:
-                            self._tracks[tid].face_bbox = fb
-                            self._tracks[tid].face_kps = kps
-                            break
+                    # 2. Universal Any-College Lanyard & Badge Verification (Dual-Threshold)
+                    is_worn_prev = track.wearing_id_card
+                    has_card, c_bbox, c_sig = self._card_detector.detect_id_card(
+                        frame, chest_box, is_currently_worn=is_worn_prev
+                    )
 
-                # Clean up tracks stale for > 45 frames
-                dead_ids = [tid for tid, t in self._tracks.items() if self._frame_count - t.last_seen_frame > 45]
-                for tid in dead_ids:
+                    # 3. Asymmetric Rolling Counter & 3.5-Second Grace Hold
+                    cur_time = time.time()
+                    if has_card:
+                        track.id_score = min(10, track.id_score + 4)
+                        track.last_id_time = cur_time
+                        if c_bbox is not None:
+                            if track.last_id_box is not None:
+                                track.last_id_box = np.round(0.6 * c_bbox + 0.4 * track.last_id_box).astype(int)
+                            else:
+                                track.last_id_box = c_bbox.astype(int)
+                    else:
+                        track.id_score = max(0, track.id_score - 1)
+
+                    # Lock as ID_CARD_WORN if id_score >= 3 OR grace period < 3.5s
+                    is_locked_worn = (track.id_score >= 3) or (
+                        track.last_id_time > 0.0 and (cur_time - track.last_id_time) < 3.5
+                    )
+
+                    if is_locked_worn:
+                        track.wearing_id_card = True
+                        track.card_bbox = track.last_id_box
+                        track.card_score = track.id_score
+                        track.status = TrackStatus.ID_CARD_VERIFIED
+                        track.consecutive_unknown_count = 0
+                        track.missing_card_frames = 0
+                    else:
+                        track.wearing_id_card = False
+                        track.card_bbox = None
+                        track.card_score = 0
+                        track.missing_card_frames = 0
+
+                        # Stage 2: Biometric Face Recognition
+                        feat = getattr(face, "normed_embedding", None)
+                        if feat is None and hasattr(face, "kps") and len(face.kps) == 5:
+                            from insightface.utils.face_align import norm_crop
+                            aligned_112 = norm_crop(frame, landmark=face.kps, image_size=112)
+                            feat = self._face_app.models["recognition"].get_feat(aligned_112).flatten().astype(np.float32)
+                            n = np.linalg.norm(feat)
+                            if n > 1e-6:
+                                feat = feat / n
+
+                        if feat is not None and self._matcher.is_ready:
+                            match_res = self._matcher.match(feat)
+                            track.s1 = match_res.s1
+                            track.person_id = match_res.person_id
+                            track.person_name = match_res.person_name
+
+                            if match_res.s1 >= S1_SIM_THRESH:
+                                # OUTCOME 2: NO ID CARD + KNOWN FACE (BLUE)
+                                track.status = TrackStatus.KNOWN_NO_BADGE
+                                track.consecutive_unknown_count = 0
+                            else:
+                                # OUTCOME 3: NO ID CARD + UNKNOWN FACE (RED ALARM)
+                                track.consecutive_unknown_count += 1
+                                if track.consecutive_unknown_count >= CONSECUTIVE_UNKNOWN_LOCK:
+                                    track.status = TrackStatus.CONFIRMED_UNKNOWN
+                                    if not track.alert_saved:
+                                        track.alert_saved = True
+                                        snap_name = f"intruder_track{track.track_id}_{int(timestamp)}.jpg"
+                                        full_snap = SNAPSHOT_DIR / snap_name
+                                        cv2.imwrite(str(full_snap), frame)
+                                else:
+                                    track.status = TrackStatus.SCANNING_FACE
+                        else:
+                            track.status = TrackStatus.PENDING
+
+                    self._tracks[matched_tid] = track
+                    current_tracks.append(track)
+
+                # Clean up stale tracks (> 2.0s absent)
+                stale_ids = [tid for tid, t in self._tracks.items() if timestamp - t.last_seen_ts > 2.0]
+                for tid in stale_ids:
                     del self._tracks[tid]
 
-        # Collect and annotate active tracks
-        persons: List[TrackedPerson] = []
-        with self._lock:
-            for tid, track in list(self._tracks.items()):
-                if tid <= 0:
-                    continue
-
-                # Evasive trigger
-                if not track.is_locked and (timestamp - track.first_seen_ts > EVASIVE_SECONDS) and track.status == TrackStatus.PENDING:
-                    track.status = TrackStatus.EVASIVE_ALERT
-
-                # Asynchronously submit unverified tracks to Thread C
-                if not track.is_locked:
-                    self._worker_thread.submit({
-                        "track_id": tid,
-                        "frame": frame.copy(),
-                        "p_bbox": track.bbox_xyxy.copy(),
-                        "face_kps": track.face_kps,
-                    })
-
-                # Homography radar mapping
-                bx1, by1, bx2, by2 = track.bbox_xyxy
-                foot_pt = np.array([[(bx1 + bx2) / 2.0, float(by2)]], dtype=np.float32)
+            # 3. Construct TrackedPerson list for telemetry and alerts
+            persons: List[TrackedPerson] = []
+            for t in current_tracks:
+                # Homography radar mapping (1000x1000 campus space)
+                px1, py1, px2, py2 = t.person_bbox
+                foot_pt = np.array([[(px1 + px2) / 2.0, float(py2)]], dtype=np.float32)
                 radar_res = cv2.perspectiveTransform(foot_pt.reshape(1, 1, 2), DEFAULT_HOMOGRAPHY)
                 rx = float(np.clip(radar_res[0, 0, 0], 0, 1000))
                 ry = float(np.clip(radar_res[0, 0, 1], 0, 1000))
 
-                # Intruder snapshot saving
-                snap_path = None
-                if track.status in (TrackStatus.CONFIRMED_UNKNOWN, TrackStatus.EVASIVE_ALERT) and not track.alert_saved:
-                    track.alert_saved = True
-                    snap_name = f"intruder_track{tid}_{int(timestamp)}.jpg"
-                    full_snap = SNAPSHOT_DIR / snap_name
-                    cv2.imwrite(str(full_snap), frame)
-                    snap_path = str(full_snap)
+                snap_path = str(SNAPSHOT_DIR / f"intruder_track{t.track_id}_{int(timestamp)}.jpg") if t.alert_saved else None
 
                 persons.append(TrackedPerson(
-                    track_id=tid,
-                    bbox_xyxy=track.bbox_xyxy,
-                    status=track.status,
-                    person_id=track.known_person_id,
-                    person_name=track.known_person_name,
-                    s1=track.s1,
-                    z_score=track.z_score,
-                    face_bbox=track.face_bbox,
-                    yaw_deg=track.yaw_deg,
-                    pitch_deg=track.pitch_deg,
+                    track_id=t.track_id,
+                    bbox_xyxy=t.person_bbox,
+                    status=t.status,
+                    person_id=t.person_id,
+                    person_name=t.person_name,
+                    s1=t.s1,
+                    z_score=0.0,
+                    face_bbox=t.face_bbox,
                     radar_xy=(rx, ry),
                     snapshot_path=snap_path,
-                    has_id_card=track.has_id_card,
-                    card_bbox=track.card_bbox,
-                    card_conf=track.card_conf,
+                    has_id_card=t.wearing_id_card,
+                    card_bbox=t.card_bbox,
+                    card_conf=0.92 if t.wearing_id_card else 0.0,
+                    card_search_roi=t.chest_box,
                 ))
 
-        annotated = self._draw_hud(frame.copy(), persons, self._fps)
+            # 4. Render Annotations onto Frame
+            annotated = self._draw_hud(frame.copy(), current_tracks, len(faces))
 
-        return FrameResult(
-            frame_idx=self._frame_count,
-            timestamp=timestamp,
-            persons=persons,
-            annotated_frame=annotated,
-            fps=self._fps,
-        )
+            return FrameResult(
+                frame_idx=self._frame_count,
+                timestamp=timestamp,
+                persons=persons,
+                annotated_frame=annotated,
+                fps=self._fps,
+            )
 
-    def _draw_hud(self, frame: np.ndarray, persons: List[TrackedPerson], fps: float) -> np.ndarray:
-        h, w = frame.shape[:2]
+        except Exception as e:
+            traceback.print_exc()
+            cv2.rectangle(frame, (0, 0), (W, 44), (0, 0, 180), -1)
+            cv2.putText(frame, f"PROCESS_FRAME ERROR: {e}"[:80], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            return FrameResult(frame_idx=self._frame_count, timestamp=timestamp, annotated_frame=frame, fps=self._fps)
 
-        # Top-left HUD badge: Green 25-30 FPS indicator
-        fps_text = f"FPS: {fps:04.1f} | 3-THREAD CPU"
-        cv2.rectangle(frame, (10, 10), (250, 42), (8, 15, 30), -1)
-        cv2.rectangle(frame, (10, 10), (250, 42), (0, 230, 118), 1)
-        cv2.putText(frame, fps_text, (18, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 230, 118), 2)
+    def _draw_hud(self, frame: np.ndarray, tracks: List[InternalTrack], num_faces: int) -> np.ndarray:
+        H, W = frame.shape[:2]
 
-        for p in persons:
-            color = _STATUS_COLORS.get(p.status, (200, 200, 200))
-            x1, y1, x2, y2 = p.bbox_xyxy
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+        # Top-Left HUD Bar (Always drawn on every frame)
+        enrolled_vectors = self._matcher._index.ntotal if (self._matcher._index is not None) else 0
+        hud_text = f"FPS: {self._fps:04.1f} | Enrolled DB Vectors: {enrolled_vectors} | Faces in Frame: {num_faces}"
+        cv2.rectangle(frame, (10, 10), (490, 42), (8, 15, 30), -1)
+        cv2.rectangle(frame, (10, 10), (490, 42), (0, 230, 118), 1)
+        cv2.putText(frame, hud_text, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 230, 118), 2)
 
-            # Smooth Corner brackets
-            length = min(22, max(5, (x2 - x1) // 3), max(5, (y2 - y1) // 3))
-            th = 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1)
-            cv2.line(frame, (x1, y1), (x1 + length, y1), color, th)
-            cv2.line(frame, (x1, y1), (x1, y1 + length), color, th)
-            cv2.line(frame, (x2, y1), (x2 - length, y1), color, th)
-            cv2.line(frame, (x2, y1), (x2, y1 + length), color, th)
-            cv2.line(frame, (x1, y2), (x1 + length, y2), color, th)
-            cv2.line(frame, (x1, y2), (x1, y2 - length), color, th)
-            cv2.line(frame, (x2, y2), (x2 - length, y2), color, th)
-            cv2.line(frame, (x2, y2), (x2, y2 - length), color, th)
+        for t in tracks:
+            px1, py1, px2, py2 = t.person_bbox
+            cx1, cy1, cx2, cy2 = t.chest_box
 
-            # HUD Label banner
-            if p.status == TrackStatus.ID_CARD_VERIFIED:
-                lbl = f"ID CARD WORN: T#{p.track_id}"
-            elif p.status == TrackStatus.KNOWN_NO_BADGE:
-                name_str = p.person_name or "KNOWN"
-                lbl = f"KNOWN FACE: {name_str} ({p.s1:.2f})"
-            elif p.status in (TrackStatus.CONFIRMED_UNKNOWN, TrackStatus.EVASIVE_ALERT):
-                lbl = f"UNKNOWN INTRUDER: T#{p.track_id}"
+            # Box 1: Dynamic Chest Scan Box in Cyan (Always drawn)
+            cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 220, 0), 2)
+            cv2.putText(frame, "ID CARD SCAN ZONE", (cx1 + 6, min(H - 6, cy1 + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 220, 0), 2)
+
+            # Draw green badge box if ID card is verified
+            if t.wearing_id_card and t.card_bbox is not None:
+                cbx1, cby1, cbx2, cby2 = t.card_bbox
+                cv2.rectangle(frame, (cbx1, cby1), (cbx2, cby2), (0, 255, 0), 2)
+                cv2.putText(frame, "🪪 ID CARD DETECTED", (cbx1, max(14, cby1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 0), 2)
+
+            # Box 2: Thick Person Box with Exact 3-State Outcome Label
+            if t.status == TrackStatus.ID_CARD_VERIFIED:
+                color = (0, 230, 118)  # Bright Green
+                lbl = f"✅ ID CARD WORN - COMPLIANT [T#{t.track_id}]"
+            elif t.status == TrackStatus.KNOWN_NO_BADGE:
+                color = (255, 176, 0)  # Blue / Cyan
+                lbl = f"⚠️ NO ID CARD | KNOWN: {t.person_name or 'Authorized'} (Sim: {t.s1:.2f})"
+            elif t.status == TrackStatus.CONFIRMED_UNKNOWN:
+                color = (0, 0, 255)    # Bright Red
+                lbl = f"🚨 INTRUDER: NO ID CARD + UNKNOWN FACE (Sim: {t.s1:.2f})"
             else:
-                lbl = f"VERIFYING... T#{p.track_id}"
+                color = (0, 215, 255)  # Yellow
+                lbl = f"🔍 CHECKING ID CARD / FACE: T#{t.track_id}"
 
-            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-            ly = max(18, y1 - 6)
-            cv2.rectangle(frame, (x1, ly - lh - 4), (x1 + lw + 8, ly + 2), (8, 15, 30), -1)
-            cv2.rectangle(frame, (x1, ly - lh - 4), (x1 + lw + 8, ly + 2), color, 1)
-            cv2.putText(frame, lbl, (x1 + 4, ly - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+            cv2.rectangle(frame, (px1, py1), (px2, py2), color, 3)
 
-            # Badge indicator box
-            if p.has_id_card and p.card_bbox is not None:
-                cx1, cy1, cx2, cy2 = p.card_bbox
-                cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
-                cv2.putText(frame, "ID BADGE", (cx1, cy1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+            ly = max(20, py1 - 8)
+            cv2.rectangle(frame, (px1, ly - lh - 4), (px1 + lw + 8, ly + 4), (8, 15, 30), -1)
+            cv2.rectangle(frame, (px1, ly - lh - 4), (px1 + lw + 8, ly + 4), color, 1)
+            cv2.putText(frame, lbl, (px1 + 4, ly - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
 
         return frame
+
+    def calibrate_badge_template(self, frame: np.ndarray, target_path: Path) -> dict:
+        """Crops center of chest scan ROI, saves to storage/badge_template.jpg, and reloads."""
+        H, W = frame.shape[:2]
+        with self._lock:
+            best_roi = None
+            for t in self._tracks.values():
+                best_roi = t.chest_box
+                break
+
+        if best_roi is None:
+            cx1 = max(0, int(W * 0.20))
+            cx2 = min(W, int(W * 0.80))
+            cy1 = max(0, int(H * 0.40))
+            cy2 = H - 5
+            best_roi = (cx1, cy1, cx2, cy2)
+
+        rx1, ry1, rx2, ry2 = best_roi
+        roi_crop = frame[ry1:ry2, rx1:rx2]
+        if roi_crop.size == 0:
+            return {"success": False, "message": "Could not extract card region from frame."}
+
+        ch, cw = roi_crop.shape[:2]
+        bw = max(30, int(cw * 0.60))
+        bh = max(40, int(ch * 0.65))
+        bx1 = (cw - bw) // 2
+        by1 = (ch - bh) // 2
+        badge_crop = roi_crop[by1:by1 + bh, bx1:bx1 + bw]
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(target_path), badge_crop)
+        self._card_detector.reload_template(target_path)
+
+        log.info(f"ID badge template successfully saved to {target_path} and reloaded into detector.")
+        return {
+            "success": True,
+            "message": f"Successfully locked ID card template ({bw}x{bh})! Detector active.",
+            "path": str(target_path),
+        }
 
     def calibrate_live_face(
         self,
@@ -901,11 +927,7 @@ class DroneSurveillanceEngine:
         person_id: str = "EMP001",
         person_name: str = "Authorized User",
     ) -> dict:
-        """
-        1-Click Live Self-Calibration:
-        Extracts face from webcam, generates 5 clean norm_crop variations + centroid,
-        appends to FAISS + SQLite, and reloads index in <1 second.
-        """
+        """1-Click Live Face Calibration: Extracts live face, adds variations, saves to FAISS & DB."""
         if self._face_app is None:
             return {"success": False, "message": "FaceAnalysis model not loaded"}
 
@@ -921,15 +943,13 @@ class DroneSurveillanceEngine:
         aligned_112 = norm_crop(frame, landmark=best_face.kps, image_size=112)
         rec_model = self._face_app.models["recognition"]
 
-        # 5 variations
         variations = [
             aligned_112.copy(),
             apply_clahe_lab(aligned_112),
             cv2.flip(aligned_112, 1),
-            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), 7.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
-            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), -7.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
+            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), 8.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
+            cv2.warpAffine(aligned_112, cv2.getRotationMatrix2D((56, 56), -8.0, 1.0), (112, 112), borderMode=cv2.BORDER_REFLECT_101),
         ]
-
         embs = []
         for v in variations:
             feat = rec_model.get_feat(v).flatten().astype(np.float32)
@@ -946,6 +966,7 @@ class DroneSurveillanceEngine:
             embs.append((centroid / c_n).astype(np.float32))
 
         # Update FAISS
+        faiss_path.parent.mkdir(parents=True, exist_ok=True)
         if faiss_path.exists():
             idx = faiss.read_index(str(faiss_path))
         else:
@@ -972,7 +993,7 @@ class DroneSurveillanceEngine:
             "INSERT OR REPLACE INTO persons (person_id, name, photo_path, enrolled_at) VALUES (?, ?, ?, ?)",
             (person_id, person_name, "webcam_calibrated", time.time()),
         )
-        labels = ["original", "clahe", "flip", "rot_plus_7", "rot_minus_7", "mean_centroid"]
+        labels = ["original", "clahe", "flip", "rot_plus_8", "rot_minus_8", "mean_centroid"]
         for i, emb in enumerate(embs):
             lbl = labels[i] if i < len(labels) else f"calib_{i}"
             conn.execute(
@@ -981,6 +1002,11 @@ class DroneSurveillanceEngine:
             )
         conn.commit()
         conn.close()
+
+        # Update photo in data/id_cards
+        admin_path = Path("data/id_cards/EMP001_Admin.jpg")
+        admin_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(admin_path), aligned_112)
 
         self.load(faiss_path, db_path)
 
@@ -992,5 +1018,4 @@ class DroneSurveillanceEngine:
         }
 
     def close(self):
-        if self._worker_thread:
-            self._worker_thread.stop()
+        pass

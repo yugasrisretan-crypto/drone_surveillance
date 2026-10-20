@@ -64,6 +64,7 @@ VIDEO_PATH   = ROOT / "data" / "videos" / "campus_drone.mp4"
 FAISS_PATH   = ROOT / "storage" / "campus.faiss"
 DB_PATH      = ROOT / "storage" / "campus.db"
 ID_CARDS_DIR = ROOT / "data" / "id_cards"
+BADGE_TEMPLATE_PATH = ROOT / "storage" / "badge_template.jpg"
 STATIC_DIR   = ROOT / "static"
 
 SOURCE_WEBCAM = "webcam"
@@ -206,6 +207,32 @@ def _detect_alerts(persons: list) -> list:
             except Exception as e:
                 log.warning(f"Could not record alert: {e}")
 
+        elif status_str == "KNOWN_NO_BADGE" and prev != status_str:
+            ts = time.time()
+            alerts.append({
+                "type":          "badge_warning",
+                "is_intruder":   False,
+                "track_id":      p.track_id,
+                "status":        status_str,
+                "person_name":   p.person_name or "Authorized Person",
+                "snapshot_url":  None,
+                "timestamp":     ts,
+                "timestamp_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                "s1":            round(float(p.s1), 3),
+                "z_score":       round(float(p.z_score), 2),
+            })
+            try:
+                conn = sqlite3.connect(str(DB_PATH))
+                conn.execute(
+                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (p.track_id, status_str, p.person_name or "Authorized Person", p.s1, p.z_score, "", ts),
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                log.warning(f"Could not record badge warning: {e}")
+
         _prev_statuses[p.track_id] = status_str
 
     for old_id in list(_prev_statuses.keys()):
@@ -257,8 +284,16 @@ def processing_loop():
 
         # Process frame through surveillance engine
         now = time.time()
-        with reload_lock:
-            res = engine.process_frame(frame, timestamp=now)
+        try:
+            with reload_lock:
+                res = engine.process_frame(frame, timestamp=now)
+        except Exception as e:
+            traceback.print_exc()
+            H, W = frame.shape[:2]
+            err_msg = f"SERVER PROCESS ERROR: {e}"
+            cv2.rectangle(frame, (0, 0), (W, 44), (0, 0, 180), -1)
+            cv2.putText(frame, err_msg[:80], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            res = FrameResult(frame_idx=0, timestamp=now, annotated_frame=frame, fps=0.0)
 
         _fps_counter = res.fps
 
@@ -435,6 +470,30 @@ async def api_enroll_live():
 
 
 # ---------------------------------------------------------------------------
+# 1-Click Worn ID Card Calibration Endpoint
+# ---------------------------------------------------------------------------
+@app.post("/api/calibrate_badge")
+async def api_calibrate_badge():
+    """
+    Crops the center of card_search_roi, saves to storage/badge_template.jpg,
+    extracts its ORB descriptors and color profile on the fly, and uses it immediately.
+    """
+    with _raw_frame_lock:
+        if _latest_raw_frame is None:
+            raise HTTPException(400, "No live webcam frame available. Check camera.")
+        frame_copy = _latest_raw_frame.copy()
+
+    def do_calibrate_badge():
+        with reload_lock:
+            return engine.calibrate_badge_template(frame_copy, BADGE_TEMPLATE_PATH)
+
+    result = await asyncio.to_thread(do_calibrate_badge)
+    if not result.get("success", False):
+        raise HTTPException(400, result.get("message", "Badge template calibration failed"))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Standard Photo Upload Enrollment Endpoint
 # ---------------------------------------------------------------------------
 @app.post("/api/enroll")
@@ -542,6 +601,46 @@ async def api_alerts(limit: int = 50):
     except Exception as e:
         log.error(f"Alerts query error: {e}")
         return []
+
+
+@app.get("/api/export_csv", include_in_schema=False)
+async def api_export_csv():
+    """Download Security Audit Log as CSV for college evaluation."""
+    import io
+    import csv
+    from fastapi.responses import Response
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Record ID",
+        "Track ID",
+        "Alert Type",
+        "Identified Person",
+        "Cosine Similarity (S1)",
+        "Cohort Z-Score",
+        "Snapshot URL",
+        "Timestamp",
+    ])
+    if DB_PATH.exists():
+        try:
+            conn = sqlite3.connect(str(DB_PATH))
+            rows = conn.execute(
+                "SELECT id, track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at "
+                "FROM alerts ORDER BY created_at DESC"
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r[7])) if r[7] else ""
+                writer.writerow([r[0], r[1], r[2], r[3], round(float(r[4] or 0), 4), round(float(r[5] or 0), 2), r[6], t_str])
+        except Exception as e:
+            log.warning(f"Export CSV read error: {e}")
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=campus_security_audit.csv"},
+    )
 
 
 @app.get("/snapshots/{filename}", include_in_schema=False)

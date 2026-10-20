@@ -95,8 +95,8 @@ def generate_aligned_variations(aligned_face: np.ndarray) -> List[Tuple[np.ndarr
       1. Original aligned face
       2. CLAHE illumination-normalized
       3. Horizontal flip
-      4. +7 deg mild tilt
-      5. -7 deg mild tilt
+      4. +8 deg mild rotation
+      5. -8 deg mild rotation
     """
     views: List[Tuple[np.ndarray, int, str]] = []
     # 1. Original
@@ -105,20 +105,20 @@ def generate_aligned_variations(aligned_face: np.ndarray) -> List[Tuple[np.ndarr
     views.append((apply_clahe(aligned_face), 2, "clahe_normalized"))
     # 3. Horizontal flip
     views.append((cv2.flip(aligned_face, 1), 3, "horizontal_flip"))
-    # 4. +7 deg tilt
-    views.append((rotate_face(aligned_face, 7.0), 4, "rot_plus_7deg"))
-    # 5. -7 deg tilt
-    views.append((rotate_face(aligned_face, -7.0), 5, "rot_minus_7deg"))
+    # 4. +8 deg tilt
+    views.append((rotate_face(aligned_face, 8.0), 4, "rot_plus_8deg"))
+    # 5. -8 deg tilt
+    views.append((rotate_face(aligned_face, -8.0), 5, "rot_minus_8deg"))
     return views
 
 
 # ---------------------------------------------------------------------------
-# InsightFace buffalo_sc Model Loader
+# InsightFace buffalo_l Model Loader (Pure ResNet-50 w600k_r50.onnx)
 # ---------------------------------------------------------------------------
 _face_app = None
 
 def get_face_app(det_thresh: float = 0.3):
-    """Load and cache InsightFace buffalo_sc model tuned for CPU."""
+    """Load and cache InsightFace buffalo_l model tuned for CPU."""
     global _face_app
     if _face_app is None:
         try:
@@ -127,21 +127,21 @@ def get_face_app(det_thresh: float = 0.3):
             log.error("insightface is not installed. Run: pip install insightface")
             sys.exit(1)
 
-        log.info("Loading InsightFace buffalo_sc (CPU, ORT_SEQUENTIAL, 4 threads)...")
+        log.info("Loading InsightFace buffalo_l (detection + recognition) with det_size=(320, 320)...")
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 4
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         app = FaceAnalysis(
-            name="buffalo_sc",
+            name="buffalo_l",
             providers=["CPUExecutionProvider"],
             allowed_modules=["detection", "recognition"],
             session_options=opts,
         )
-        app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=det_thresh)
+        app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=det_thresh)
         _face_app = app
-        log.info("buffalo_sc model loaded successfully.")
+        log.info("buffalo_l model loaded successfully.")
     return _face_app
 
 
@@ -167,6 +167,22 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             view_label  TEXT NOT NULL,
             FOREIGN KEY (person_id) REFERENCES persons(person_id)
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id      INTEGER,
+            alert_type    TEXT,
+            top1_person   TEXT,
+            s1            REAL,
+            z_score       REAL,
+            snapshot_path TEXT,
+            created_at    REAL
+        )
+    """)
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS vector_map AS
+        SELECT faiss_id, person_id, view_index, view_label FROM vectors;
     """)
     conn.commit()
     return conn
@@ -291,8 +307,11 @@ def enroll_all(
                 scale = 1280.0 / max(h, w)
                 bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-            # Detect face
-            faces = app.get(bgr)
+            # Pad image with 100px border so close-up ID card faces do not touch image edges
+            padded_bgr = cv2.copyMakeBorder(bgr, 100, 100, 100, 100, cv2.BORDER_CONSTANT, value=[128, 128, 128])
+
+            # Detect face in padded image
+            faces = app.get(padded_bgr)
             if not faces:
                 log.warning(f"  [WARN] No face found in {photo_path.name}")
                 failed_photos.append(str(photo_path))
@@ -304,8 +323,8 @@ def enroll_all(
                 log.warning(f"  [WARN] Missing 5 landmarks for face in {photo_path.name}")
                 continue
 
-            # Strict 5-point norm_crop alignment (112x112)
-            aligned_face = norm_crop(bgr, landmark=best_face.kps, image_size=112)
+            # Strict 5-point norm_crop alignment (112x112) from padded image
+            aligned_face = norm_crop(padded_bgr, landmark=best_face.kps, image_size=112)
 
             # Generate 5 clean variations
             variations = generate_aligned_variations(aligned_face)
