@@ -76,54 +76,6 @@ def apply_clahe_lab(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: 
 
 
 # ---------------------------------------------------------------------------
-# Automated Security Dispatch Notification Helper
-# ---------------------------------------------------------------------------
-def send_security_notification(message: str, snapshot_path: Optional[str] = None) -> bool:
-    """
-    Logs formatted security messages to storage/security_dispatch.log
-    and supports optional Telegram / WhatsApp HTTP webhook URLs via environment variables.
-    """
-    try:
-        log_file = Path("storage/security_dispatch.log")
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        t_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        entry = f"[{t_stamp}] {message} | Snapshot: {snapshot_path or 'None'}\n"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(entry)
-
-        # Optional Telegram Webhook: TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID
-        tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
-        if tg_token and tg_chat:
-            try:
-                import urllib.request
-                import urllib.parse
-                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-                data = urllib.parse.urlencode({"chat_id": tg_chat, "text": message}).encode("utf-8")
-                req = urllib.request.Request(url, data=data)
-                urllib.request.urlopen(req, timeout=3)
-            except Exception as ex:
-                log.warning(f"Telegram webhook failed: {ex}")
-
-        # Optional WhatsApp / Generic HTTP Webhook: SECURITY_WEBHOOK_URL or WHATSAPP_WEBHOOK_URL
-        webhook_url = os.environ.get("SECURITY_WEBHOOK_URL") or os.environ.get("WHATSAPP_WEBHOOK_URL")
-        if webhook_url:
-            try:
-                import urllib.request
-                import json
-                payload = json.dumps({"message": message, "snapshot_path": snapshot_path, "timestamp": time.time()}).encode("utf-8")
-                req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=3)
-            except Exception as ex:
-                log.warning(f"Security Webhook failed: {ex}")
-
-        return True
-    except Exception as e:
-        log.warning(f"send_security_notification error: {e}")
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Status Enumeration & Colors
 # ---------------------------------------------------------------------------
 class TrackStatus(Enum):
@@ -172,10 +124,7 @@ class InternalTrack:
     person_bbox:            np.ndarray
     chest_box:              Tuple[int, int, int, int]
     last_seen_ts:           float
-    card_score:             int           = 0      # Rolling score
-    id_score:               int           = 0      # Asymmetric counter (0 to 10)
-    last_id_time:           float         = 0.0    # Timestamp of last raw card detection
-    last_id_box:            Optional[np.ndarray] = None  # Exponentially smoothed card bbox
+    card_score:             int           = 0      # Rolling score: +2 on detect, -1 on miss
     wearing_id_card:        bool          = False
     missing_card_frames:    int           = 0  # Frames without card detection
     card_bbox:              Optional[np.ndarray] = None
@@ -184,9 +133,9 @@ class InternalTrack:
     person_name:            Optional[str] = None
     s1:                     float         = 0.0
     consecutive_unknown_count: int        = 0
-    no_id_consecutive_checks: int        = 0      # Verification checks without ID card
-    last_dispatch_time:       float       = 0.0    # Timestamp of last security dispatch (30s cooldown)
     alert_saved:            bool          = False
+    consecutive_no_card_count: int        = 0
+    last_dispatch_ts:       float         = 0.0
 
 
 @dataclass
@@ -207,8 +156,6 @@ class TrackedPerson:
     card_bbox:      Optional[np.ndarray]= None
     card_conf:      float               = 0.0
     card_search_roi:Optional[Tuple[int, int, int, int]] = None
-    security_message: Optional[str]     = None
-    security_alert_level: Optional[str] = None
 
 
 @dataclass
@@ -219,6 +166,54 @@ class FrameResult:
     annotated_frame:Optional[np.ndarray] = None
     fps:            float                = 0.0
     dispatches:     List[dict]           = field(default_factory=list)
+
+
+def send_security_notification(message: str, snapshot_path: Optional[str] = None):
+    """
+    Logs formatted security dispatch message to storage/security_dispatch.log
+    and supports optional Telegram/WhatsApp HTTP webhook URLs via environment variables:
+      - SECURITY_WEBHOOK_URL
+      - TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID
+    """
+    try:
+        log_dir = Path("storage")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "security_dispatch.log"
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{ts_str}] {message} | snapshot={snapshot_path or 'none'}\n")
+    except Exception as e:
+        log.warning(f"Error logging security dispatch: {e}")
+
+    # Optional HTTP Webhook dispatch
+    webhook_url = os.environ.get("SECURITY_WEBHOOK_URL")
+    if webhook_url:
+        try:
+            import urllib.request
+            import json as _json
+            payload = _json.dumps({"text": message, "snapshot": snapshot_path}).encode("utf-8")
+            req = urllib.request.Request(
+                webhook_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=2.0)
+        except Exception as ex:
+            log.warning(f"Webhook dispatch error: {ex}")
+
+    # Optional Telegram Bot dispatch
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if tg_token and tg_chat_id:
+        try:
+            import urllib.request
+            import urllib.parse
+            tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+            data = urllib.parse.urlencode({"chat_id": tg_chat_id, "text": message}).encode("utf-8")
+            urllib.request.urlopen(tg_url, data=data, timeout=2.0)
+        except Exception as ex:
+            log.warning(f"Telegram dispatch error: {ex}")
 
 
 # ---------------------------------------------------------------------------
@@ -414,21 +409,12 @@ class UniversalBadgeDetector:
             return 0.0, 0.0
         return float(np.mean(steps)), float(max(steps))
 
-    def detect_id_card(
-        self,
-        frame: np.ndarray,
-        chest_box: Tuple[int, int, int, int],
-        is_currently_worn: bool = False,
-    ) -> Tuple[bool, Optional[np.ndarray], str]:
+    def detect_id_card(self, frame: np.ndarray, chest_box: Tuple[int, int, int, int]) -> Tuple[bool, Optional[np.ndarray], str]:
         """
-        Universal ID Card & Lanyard Detector with Dual-Threshold Locking:
-        - If is_currently_worn is False (Entry Mode):
-            min_bright = max(155, int(mean_g + 32)), k_open = max(7, int(rw * 0.065)) | 1,
-            solidity >= 0.65, area_frac >= 0.05 (t-shirt text never false-triggers).
-        - If is_currently_worn is True (Hold Mode):
-            min_bright = max(135, int(mean_g + 20)), k_open = max(5, int(rw * 0.045)) | 1,
-            solidity >= 0.45, area_frac >= 0.03, OR yellow/blue lanyard fraction >= 0.012
-            (slight badge movement or glare shifts never drop detection).
+        Universal ID Card & Lanyard Detector with Strict Mathematical Rejection:
+        1. Eliminate Bare Neck Skin: Strict co-occurrence requires BOTH vivid Yellow (>2.5%) AND Royal Blue (>1.0%).
+        2. Eliminate T-Shirt Graphics: Proportional MORPH_OPEN filter erases thin cursive text/print.
+        3. Strict Solid Card Core: Contour area 6%-55% ROI, aspect ratio 0.50-2.2, solidity >= 0.65.
         """
         cx1, cy1, cx2, cy2 = chest_box
         if cy2 <= cy1 + 20 or cx2 <= cx1 + 20:
@@ -443,70 +429,53 @@ class UniversalBadgeDetector:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         sat = hsv[:, :, 1]
-        mean_g = float(np.mean(gray))
 
         # -------------------------------------------------------------------
-        # 1. Lanyard Detection
+        # 1. Eliminate Bare Neck Skin False Positives (Strict Lanyard Co-Occurrence)
         # -------------------------------------------------------------------
-        yellow_mask = cv2.inRange(hsv, (23, 140, 140), (36, 255, 255))
+        # Vivid Yellow: Hue 23-36, Sat 140-255, Val 140-255
+        yellow_mask = cv2.inRange(hsv, (25, 160, 140), (35, 255, 255))
+        # Royal Blue: Hue 100-135, Sat 115-255, Val 70-255
         blue_mask = cv2.inRange(hsv, (100, 115, 70), (135, 255, 255))
 
         yellow_pct = float(np.count_nonzero(yellow_mask)) / roi_area
         blue_pct = float(np.count_nonzero(blue_mask)) / roi_area
 
-        if not is_currently_worn:
-            # Entry Mode: Require co-occurrence of vivid Yellow (>2.5%) AND Royal Blue (>1.0%)
-            lanyard_detected = (yellow_pct > 0.025) and (blue_pct > 0.010)
-        else:
-            # Hold Mode: yellow/blue lanyard fraction >= 0.012
-            lanyard_detected = (yellow_pct >= 0.012) or (blue_pct >= 0.012) or ((yellow_pct + blue_pct) >= 0.018)
+        lanyard_detected = (yellow_pct > 0.04) and (blue_pct > 0.015)
 
         # -------------------------------------------------------------------
-        # 2. Dual-Threshold Configuration (Entry vs Hold Mode)
+        # 2. Eliminate T-Shirt Graphic False Positives (MORPH_OPEN Erase Filter)
         # -------------------------------------------------------------------
-        if not is_currently_worn:
-            # Entry Mode: Strict thresholds
-            min_bright = max(155, int(mean_g + 32))
-            k_open = max(7, int(rw * 0.065)) | 1
-            min_solidity = 0.65
-            min_area_frac = 0.05
-            max_area_frac = 0.55
-            max_sat = 65
-        else:
-            # Hold Mode: Relaxed holding thresholds
-            min_bright = max(135, int(mean_g + 20))
-            k_open = max(5, int(rw * 0.045)) | 1
-            min_solidity = 0.45
-            min_area_frac = 0.03
-            max_area_frac = 0.65
-            max_sat = 85
+        mean_gray = float(np.mean(gray))
+        bright_thresh = max(155, int(mean_gray + 35))
+        # Threshold only true white/light-gray plastic (gray > threshold and Saturation < 65)
+        white_plastic_mask = ((gray > bright_thresh) & (sat < 65)).astype(np.uint8) * 255
 
-        # Threshold bright pixels (reject skin/colored shirt by saturation)
-        white_plastic_mask = ((gray > min_bright) & (sat < max_sat)).astype(np.uint8) * 255
-
-        # Morphological Opening: erases thin shirt text
+        # Morphological Opening: wipes thin cursive t-shirt letters completely to black
+        k_open = max(7, int(rw * 0.065))
         kernel_open = np.ones((k_open, k_open), np.uint8)
         card_mask = cv2.morphologyEx(white_plastic_mask, cv2.MORPH_OPEN, kernel_open)
 
         # -------------------------------------------------------------------
-        # 3. Contour Analysis
+        # 3. Strict Solid Card Core Check
         # -------------------------------------------------------------------
         cnts, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         card_candidates = []
         for c in cnts:
             c_area = float(cv2.contourArea(c))
-            if not (min_area_frac * roi_area <= c_area <= max_area_frac * roi_area):
+            # Contour area must cover between 6% and 55% of the chest ROI
+            if not (0.06 * roi_area <= c_area <= 0.55 * roi_area):
                 continue
             bx, by, bw, bh = cv2.boundingRect(c)
-            if bw < 18 or bh < 18:
+            if bw < 20 or bh < 20:
                 continue
             aspect = float(bw) / float(max(1, bh))
-            min_asp = 0.50 if not is_currently_worn else 0.40
-            max_asp = 2.2 if not is_currently_worn else 2.5
-            if not (min_asp <= aspect <= max_asp):
+            # Aspect ratio: 0.50 <= w/h <= 2.2
+            if not (0.50 <= aspect <= 2.2):
                 continue
+            # Solidity: contourArea / (w * h) >= 0.65
             solidity = c_area / float(max(1, bw * bh))
-            if solidity < min_solidity:
+            if solidity < 0.65:
                 continue
 
             card_candidates.append(
@@ -520,6 +489,7 @@ class UniversalBadgeDetector:
             return True, best_card_box, "Solid ID Card Detected"
 
         if lanyard_detected:
+            # Lanyard verified with both Vivid Yellow and Royal Blue co-occurring
             cbw = int(rw * 0.45)
             cbh = int(cbw / 1.35)
             cbx = cx1 + (rw - cbw) // 2
@@ -527,14 +497,13 @@ class UniversalBadgeDetector:
             lanyard_box = np.array([cbx, cby, min(cx2, cbx + cbw), min(cy2, cby + cbh)], dtype=int)
             return True, lanyard_box, "Sona Lanyard (Yellow+Blue) Verified"
 
-        # Template Match Fallback (only if manually calibrated template exists)
+        # Template Match Fallback (only if manually calibrated template exists and matches strictly)
         if self.template_gray is not None:
             th, tw = self.template_gray.shape[:2]
             if th >= 20 and tw >= 20 and rh > th and rw > tw:
                 res = cv2.matchTemplate(gray, self.template_gray, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                t_thresh = 0.65 if not is_currently_worn else 0.50
-                if max_val >= t_thresh:
+                if max_val >= 0.65:
                     tx, ty = max_loc
                     template_box = np.array([cx1 + tx, cy1 + ty, cx1 + tx + tw, cy1 + ty + th], dtype=int)
                     return True, template_box, "ID Badge Template Matched"
@@ -760,44 +729,24 @@ class DroneSurveillanceEngine:
                         track.chest_box = chest_box
                         track.last_seen_ts = timestamp
 
-                    # 2. Universal Any-College Lanyard & Badge Verification (Dual-Threshold)
-                    is_worn_prev = track.wearing_id_card
-                    has_card, c_bbox, c_sig = self._card_detector.detect_id_card(
-                        frame, chest_box, is_currently_worn=is_worn_prev
-                    )
+                    # 2. Universal Any-College Lanyard & Badge Verification
+                    has_card, c_bbox, c_sig = self._card_detector.detect_id_card(frame, chest_box)
 
-                    # 3. Asymmetric Rolling Counter & 3.5-Second Grace Hold
-                    cur_time = time.time()
+                    # 3. Instant Zero-Lag Switch & Security Dispatch:
                     if has_card:
-                        track.id_score = min(10, track.id_score + 4)
-                        track.last_id_time = cur_time
-                        if c_bbox is not None:
-                            if track.last_id_box is not None:
-                                track.last_id_box = np.round(0.6 * c_bbox + 0.4 * track.last_id_box).astype(int)
-                            else:
-                                track.last_id_box = c_bbox.astype(int)
-                    else:
-                        track.id_score = max(0, track.id_score - 1)
-
-                    # Lock as ID_CARD_WORN if id_score >= 3 OR grace period < 3.5s
-                    is_locked_worn = (track.id_score >= 3) or (
-                        track.last_id_time > 0.0 and (cur_time - track.last_id_time) < 3.5
-                    )
-
-                    if is_locked_worn:
+                        track.card_score = min(12, track.card_score + 3)
+                        track.card_bbox = c_bbox
                         track.wearing_id_card = True
-                        track.card_bbox = track.last_id_box
-                        track.card_score = track.id_score
                         track.status = TrackStatus.ID_CARD_VERIFIED
                         track.consecutive_unknown_count = 0
                         track.missing_card_frames = 0
-                        track.no_id_consecutive_checks = 0
+                        track.consecutive_no_card_count = 0
                     else:
+                        track.card_score = 0
                         track.wearing_id_card = False
                         track.card_bbox = None
-                        track.card_score = 0
                         track.missing_card_frames = 0
-                        track.no_id_consecutive_checks += 1
+                        track.consecutive_no_card_count += 1
 
                         # Stage 2: Biometric Face Recognition
                         feat = getattr(face, "normed_embedding", None)
@@ -834,39 +783,41 @@ class DroneSurveillanceEngine:
                         else:
                             track.status = TrackStatus.PENDING
 
-                        # Automated Security Guard Message Generator & Alert Dispatcher:
-                        # Whenever a person track has wearing_id_card == False for >= 3 checks
-                        # and hasn't triggered a message in the last 30 seconds for that track_id.
-                        if track.no_id_consecutive_checks >= 3 and (cur_time - track.last_dispatch_time >= 30.0):
-                            track.last_dispatch_time = cur_time
-                            t_str = time.strftime("%H:%M:%S", time.localtime(cur_time))
-                            snap_name = f"dispatch_track{track.track_id}_{int(cur_time)}.jpg"
+                        # Automated Security Guard Message Generator:
+                        # Triggers when wearing_id_card == False for >= 3 consecutive checks (cooldown 30s)
+                        if track.consecutive_no_card_count >= 3 and (timestamp - track.last_dispatch_ts >= 30.0):
+                            time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
+                            snap_name = f"dispatch_track{track.track_id}_{int(timestamp)}.jpg"
                             full_snap = SNAPSHOT_DIR / snap_name
                             cv2.imwrite(str(full_snap), frame)
                             snap_url = f"/snapshots/{snap_name}"
 
-                            if track.status == TrackStatus.KNOWN_NO_BADGE or (track.person_name and track.person_name != "Unknown"):
-                                alert_lvl = "COMPLIANCE_WARNING"
-                                id_name = track.person_name or "Authorized Student"
-                                msg = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {id_name} (Track #{track.track_id}) entered without wearing an ID card at {t_str}. Action: Issue verbal reminder at gate."
+                            is_known = (track.status == TrackStatus.KNOWN_NO_BADGE) or (track.person_name and track.s1 >= S1_SIM_THRESH)
+                            if is_known:
+                                identity_name = track.person_name or "Authorized Student"
+                                sec_msg = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {identity_name} (Track #{track.track_id}) entered without wearing an ID card at {time_str}. Action: Issue verbal reminder at gate."
+                                alert_level = "COMPLIANCE_WARNING"
+                                is_intruder = False
                             else:
-                                alert_lvl = "INTRUDER_ALERT"
-                                id_name = track.person_name or "Unidentified"
-                                msg = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{track.track_id}) detected without a college ID card at {t_str}. Action: Intercept and verify identity immediately."
+                                sec_msg = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{track.track_id}) detected without a college ID card at {time_str}. Action: Intercept and verify identity immediately."
+                                alert_level = "INTRUDER_ALERT"
+                                is_intruder = True
 
-                            send_security_notification(msg, str(full_snap))
+                            track.last_dispatch_ts = timestamp
+                            send_security_notification(sec_msg, str(full_snap))
 
                             dispatches.append({
                                 "type": "security_dispatch",
-                                "alert_level": alert_lvl,
-                                "is_intruder": (alert_lvl == "INTRUDER_ALERT"),
+                                "is_intruder": is_intruder,
                                 "track_id": track.track_id,
-                                "status": track.status.name,
-                                "person_name": id_name,
+                                "status": alert_level,
+                                "alert_level": alert_level,
+                                "person_name": track.person_name or ("Authorized Student" if is_known else "Unknown Individual"),
+                                "message": sec_msg,
+                                "snapshot_path": str(full_snap),
                                 "snapshot_url": snap_url,
-                                "timestamp": cur_time,
-                                "timestamp_str": t_str,
-                                "message": msg,
+                                "timestamp": timestamp,
+                                "timestamp_str": time_str,
                                 "s1": round(float(track.s1), 3),
                                 "z_score": 0.0,
                             })
@@ -924,7 +875,7 @@ class DroneSurveillanceEngine:
             traceback.print_exc()
             cv2.rectangle(frame, (0, 0), (W, 44), (0, 0, 180), -1)
             cv2.putText(frame, f"PROCESS_FRAME ERROR: {e}"[:80], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-            return FrameResult(frame_idx=self._frame_count, timestamp=timestamp, annotated_frame=frame, fps=self._fps, dispatches=[])
+            return FrameResult(frame_idx=self._frame_count, timestamp=timestamp, annotated_frame=frame, fps=self._fps)
 
     def _draw_hud(self, frame: np.ndarray, tracks: List[InternalTrack], num_faces: int) -> np.ndarray:
         H, W = frame.shape[:2]

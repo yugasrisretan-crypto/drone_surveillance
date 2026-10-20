@@ -54,7 +54,6 @@ from vision_engine import (
     SNAPSHOT_DIR,
     ThreadedCamera,
     TrackStatus,
-    send_security_notification,
 )
 
 # ---------------------------------------------------------------------------
@@ -180,34 +179,31 @@ def _detect_alerts(persons: list) -> list:
         prev = _prev_statuses.get(p.track_id)
 
         if status_str in ("CONFIRMED_UNKNOWN", "EVASIVE_ALERT") and prev != status_str:
-            snaps = sorted(SNAPSHOT_DIR.glob(f"intruder_track{p.track_id}_*.jpg")) or sorted(SNAPSHOT_DIR.glob(f"dispatch_track{p.track_id}_*.jpg"))
+            snaps = sorted(SNAPSHOT_DIR.glob(f"intruder_track{p.track_id}_*.jpg"))
             snap_url = f"/snapshots/{snaps[-1].name}" if snaps else None
             ts = time.time()
-            t_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            msg_text = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{p.track_id}) detected without a college ID card at {t_str}. Action: Intercept and verify identity immediately."
-            alert_lvl = "INTRUDER_ALERT"
+            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            sec_msg = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{p.track_id}) detected without a college ID card at {time_str}. Action: Intercept and verify identity immediately."
             alerts.append({
                 "type":          "alert",
-                "alert_level":   alert_lvl,
                 "is_intruder":   True,
                 "track_id":      p.track_id,
                 "status":        status_str,
                 "person_name":   p.person_name or "Unknown Intruder",
+                "message":       sec_msg,
                 "snapshot_url":  snap_url,
                 "timestamp":     ts,
-                "timestamp_str": t_str,
-                "message":       msg_text,
+                "timestamp_str": time_str,
                 "s1":            round(float(p.s1), 3),
                 "z_score":       round(float(p.z_score), 2),
             })
-            send_security_notification(msg_text, snap_url)
             # Persist alert to database
             try:
                 conn = sqlite3.connect(str(DB_PATH))
                 conn.execute(
                     "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (p.track_id, alert_lvl, p.person_name or "Unknown", p.s1, p.z_score, snap_url or "", ts, msg_text),
+                    (p.track_id, status_str, p.person_name or "Unknown", p.s1, p.z_score, snap_url or "", ts, sec_msg),
                 )
                 conn.commit()
                 conn.close()
@@ -215,34 +211,29 @@ def _detect_alerts(persons: list) -> list:
                 log.warning(f"Could not record alert: {e}")
 
         elif status_str == "KNOWN_NO_BADGE" and prev != status_str:
-            snaps = sorted(SNAPSHOT_DIR.glob(f"dispatch_track{p.track_id}_*.jpg"))
-            snap_url = f"/snapshots/{snaps[-1].name}" if snaps else None
             ts = time.time()
-            t_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            id_name = p.person_name or "Authorized Student"
-            msg_text = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {id_name} (Track #{p.track_id}) entered without wearing an ID card at {t_str}. Action: Issue verbal reminder at gate."
-            alert_lvl = "COMPLIANCE_WARNING"
+            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            p_name = p.person_name or "Authorized Student"
+            sec_msg = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {p_name} (Track #{p.track_id}) entered without wearing an ID card at {time_str}. Action: Issue verbal reminder at gate."
             alerts.append({
                 "type":          "badge_warning",
-                "alert_level":   alert_lvl,
                 "is_intruder":   False,
                 "track_id":      p.track_id,
                 "status":        status_str,
-                "person_name":   id_name,
-                "snapshot_url":  snap_url,
+                "person_name":   p_name,
+                "message":       sec_msg,
+                "snapshot_url":  None,
                 "timestamp":     ts,
-                "timestamp_str": t_str,
-                "message":       msg_text,
+                "timestamp_str": time_str,
                 "s1":            round(float(p.s1), 3),
                 "z_score":       round(float(p.z_score), 2),
             })
-            send_security_notification(msg_text, snap_url)
             try:
                 conn = sqlite3.connect(str(DB_PATH))
                 conn.execute(
                     "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (p.track_id, alert_lvl, id_name, p.s1, p.z_score, snap_url or "", ts, msg_text),
+                    (p.track_id, status_str, p_name, p.s1, p.z_score, "", ts, sec_msg),
                 )
                 conn.commit()
                 conn.close()
@@ -320,26 +311,34 @@ def processing_loop():
                 _latest_annotated_jpeg = buf.tobytes()
             _new_jpeg_event.set()
 
-        # Emit any immediate new security dispatches from vision_engine
-        for d in getattr(res, "dispatches", []):
+        # Emit any immediate new alerts
+        new_alerts = _detect_alerts(res.persons)
+        for al in new_alerts:
+            manager.broadcast_from_thread(al)
+
+        # Emit and persist automated security guard message dispatches
+        for disp in getattr(res, "dispatches", []):
             try:
                 conn = sqlite3.connect(str(DB_PATH))
                 conn.execute(
                     "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (d["track_id"], d["alert_level"], d["person_name"], d.get("s1", 0.0), d.get("z_score", 0.0), d.get("snapshot_url", ""), d["timestamp"], d["message"]),
+                    (
+                        disp["track_id"],
+                        disp["alert_level"],
+                        disp["person_name"],
+                        disp.get("s1", 0.0),
+                        disp.get("z_score", 0.0),
+                        disp.get("snapshot_url", ""),
+                        disp["timestamp"],
+                        disp["message"],
+                    ),
                 )
                 conn.commit()
                 conn.close()
             except Exception as e:
-                log.warning(f"Could not record dispatch alert: {e}")
-
-            manager.broadcast_from_thread(d)
-
-        # Emit any immediate new alerts
-        new_alerts = _detect_alerts(res.persons)
-        for al in new_alerts:
-            manager.broadcast_from_thread(al)
+                log.warning(f"Could not persist dispatch alert: {e}")
+            manager.broadcast_from_thread(disp)
 
         # Telemetry updates sent every 200ms (~5 Hz)
         if now - last_telemetry_time >= 0.20:
@@ -417,9 +416,10 @@ async def lifespan(app: FastAPI):
                     message       TEXT
                 )
             """)
-            cols = [col[1] for col in conn.execute("PRAGMA table_info(alerts)").fetchall()]
-            if "message" not in cols:
+            try:
                 conn.execute("ALTER TABLE alerts ADD COLUMN message TEXT")
+            except Exception:
+                pass
             conn.commit()
             conn.close()
         except Exception as e:
@@ -631,7 +631,7 @@ async def api_alerts(limit: int = 50):
                 "snapshot_url":  r[5] if r[5] else None,
                 "timestamp":     r[6],
                 "timestamp_str": time.strftime("%H:%M:%S", time.localtime(r[6])),
-                "message":       r[7] if len(r) > 7 else None,
+                "message":       r[7] if len(r) > 7 and r[7] else "",
             }
             for r in rows
         ]
@@ -730,4 +730,4 @@ async def ws_telemetry(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info", access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=False)
