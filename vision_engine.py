@@ -76,6 +76,54 @@ def apply_clahe_lab(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: 
 
 
 # ---------------------------------------------------------------------------
+# Automated Security Dispatch Notification Helper
+# ---------------------------------------------------------------------------
+def send_security_notification(message: str, snapshot_path: Optional[str] = None) -> bool:
+    """
+    Logs formatted security messages to storage/security_dispatch.log
+    and supports optional Telegram / WhatsApp HTTP webhook URLs via environment variables.
+    """
+    try:
+        log_file = Path("storage/security_dispatch.log")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        t_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{t_stamp}] {message} | Snapshot: {snapshot_path or 'None'}\n"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(entry)
+
+        # Optional Telegram Webhook: TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID
+        tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        if tg_token and tg_chat:
+            try:
+                import urllib.request
+                import urllib.parse
+                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                data = urllib.parse.urlencode({"chat_id": tg_chat, "text": message}).encode("utf-8")
+                req = urllib.request.Request(url, data=data)
+                urllib.request.urlopen(req, timeout=3)
+            except Exception as ex:
+                log.warning(f"Telegram webhook failed: {ex}")
+
+        # Optional WhatsApp / Generic HTTP Webhook: SECURITY_WEBHOOK_URL or WHATSAPP_WEBHOOK_URL
+        webhook_url = os.environ.get("SECURITY_WEBHOOK_URL") or os.environ.get("WHATSAPP_WEBHOOK_URL")
+        if webhook_url:
+            try:
+                import urllib.request
+                import json
+                payload = json.dumps({"message": message, "snapshot_path": snapshot_path, "timestamp": time.time()}).encode("utf-8")
+                req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=3)
+            except Exception as ex:
+                log.warning(f"Security Webhook failed: {ex}")
+
+        return True
+    except Exception as e:
+        log.warning(f"send_security_notification error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Status Enumeration & Colors
 # ---------------------------------------------------------------------------
 class TrackStatus(Enum):
@@ -136,6 +184,8 @@ class InternalTrack:
     person_name:            Optional[str] = None
     s1:                     float         = 0.0
     consecutive_unknown_count: int        = 0
+    no_id_consecutive_checks: int        = 0      # Verification checks without ID card
+    last_dispatch_time:       float       = 0.0    # Timestamp of last security dispatch (30s cooldown)
     alert_saved:            bool          = False
 
 
@@ -157,6 +207,8 @@ class TrackedPerson:
     card_bbox:      Optional[np.ndarray]= None
     card_conf:      float               = 0.0
     card_search_roi:Optional[Tuple[int, int, int, int]] = None
+    security_message: Optional[str]     = None
+    security_alert_level: Optional[str] = None
 
 
 @dataclass
@@ -166,6 +218,7 @@ class FrameResult:
     persons:        List[TrackedPerson]  = field(default_factory=list)
     annotated_frame:Optional[np.ndarray] = None
     fps:            float                = 0.0
+    dispatches:     List[dict]           = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +704,7 @@ class DroneSurveillanceEngine:
                         log.error(f"Auto-seed exception: {ex}")
 
             # 2. Frame-to-frame tracking association
+            dispatches: List[dict] = []
             with self._lock:
                 current_tracks: List[InternalTrack] = []
 
@@ -737,11 +791,13 @@ class DroneSurveillanceEngine:
                         track.status = TrackStatus.ID_CARD_VERIFIED
                         track.consecutive_unknown_count = 0
                         track.missing_card_frames = 0
+                        track.no_id_consecutive_checks = 0
                     else:
                         track.wearing_id_card = False
                         track.card_bbox = None
                         track.card_score = 0
                         track.missing_card_frames = 0
+                        track.no_id_consecutive_checks += 1
 
                         # Stage 2: Biometric Face Recognition
                         feat = getattr(face, "normed_embedding", None)
@@ -777,6 +833,43 @@ class DroneSurveillanceEngine:
                                     track.status = TrackStatus.SCANNING_FACE
                         else:
                             track.status = TrackStatus.PENDING
+
+                        # Automated Security Guard Message Generator & Alert Dispatcher:
+                        # Whenever a person track has wearing_id_card == False for >= 3 checks
+                        # and hasn't triggered a message in the last 30 seconds for that track_id.
+                        if track.no_id_consecutive_checks >= 3 and (cur_time - track.last_dispatch_time >= 30.0):
+                            track.last_dispatch_time = cur_time
+                            t_str = time.strftime("%H:%M:%S", time.localtime(cur_time))
+                            snap_name = f"dispatch_track{track.track_id}_{int(cur_time)}.jpg"
+                            full_snap = SNAPSHOT_DIR / snap_name
+                            cv2.imwrite(str(full_snap), frame)
+                            snap_url = f"/snapshots/{snap_name}"
+
+                            if track.status == TrackStatus.KNOWN_NO_BADGE or (track.person_name and track.person_name != "Unknown"):
+                                alert_lvl = "COMPLIANCE_WARNING"
+                                id_name = track.person_name or "Authorized Student"
+                                msg = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {id_name} (Track #{track.track_id}) entered without wearing an ID card at {t_str}. Action: Issue verbal reminder at gate."
+                            else:
+                                alert_lvl = "INTRUDER_ALERT"
+                                id_name = track.person_name or "Unidentified"
+                                msg = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{track.track_id}) detected without a college ID card at {t_str}. Action: Intercept and verify identity immediately."
+
+                            send_security_notification(msg, str(full_snap))
+
+                            dispatches.append({
+                                "type": "security_dispatch",
+                                "alert_level": alert_lvl,
+                                "is_intruder": (alert_lvl == "INTRUDER_ALERT"),
+                                "track_id": track.track_id,
+                                "status": track.status.name,
+                                "person_name": id_name,
+                                "snapshot_url": snap_url,
+                                "timestamp": cur_time,
+                                "timestamp_str": t_str,
+                                "message": msg,
+                                "s1": round(float(track.s1), 3),
+                                "z_score": 0.0,
+                            })
 
                     self._tracks[matched_tid] = track
                     current_tracks.append(track)
@@ -824,13 +917,14 @@ class DroneSurveillanceEngine:
                 persons=persons,
                 annotated_frame=annotated,
                 fps=self._fps,
+                dispatches=dispatches,
             )
 
         except Exception as e:
             traceback.print_exc()
             cv2.rectangle(frame, (0, 0), (W, 44), (0, 0, 180), -1)
             cv2.putText(frame, f"PROCESS_FRAME ERROR: {e}"[:80], (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-            return FrameResult(frame_idx=self._frame_count, timestamp=timestamp, annotated_frame=frame, fps=self._fps)
+            return FrameResult(frame_idx=self._frame_count, timestamp=timestamp, annotated_frame=frame, fps=self._fps, dispatches=[])
 
     def _draw_hud(self, frame: np.ndarray, tracks: List[InternalTrack], num_faces: int) -> np.ndarray:
         H, W = frame.shape[:2]

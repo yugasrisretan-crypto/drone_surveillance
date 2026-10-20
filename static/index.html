@@ -576,32 +576,54 @@
       border-color: var(--unknown);
       background: linear-gradient(135deg, var(--bg-card), #1a0008);
     }
+    .alert-card.CONFIRMED_UNKNOWN,
+    .alert-card.INTRUDER_ALERT {
+      border-color: var(--unknown);
+      background: linear-gradient(135deg, var(--bg-card), #1a0008);
+    }
+    .CONFIRMED_UNKNOWN .type-pill,
+    .INTRUDER_ALERT .type-pill {
+      background: var(--unknown-dim);
+      color: var(--unknown);
+      border: 1px solid rgba(255, 23, 68, 0.4);
+    }
+
     .alert-card.EVASIVE_ALERT {
       border-color: var(--evasive);
       background: linear-gradient(135deg, var(--bg-card), #180c00);
     }
-    .alert-card.KNOWN_NO_BADGE {
-      border-color: var(--known-no-badge);
-      background: linear-gradient(135deg, var(--bg-card), #001224);
+    .EVASIVE_ALERT .type-pill { background: var(--evasive-dim); color: var(--evasive); }
+
+    .alert-card.KNOWN_NO_BADGE,
+    .alert-card.COMPLIANCE_WARNING {
+      border-color: #ffb300;
+      background: linear-gradient(135deg, var(--bg-card), #1e1502);
     }
-    .KNOWN_NO_BADGE .type-pill { background: rgba(0, 176, 255, 0.2); color: var(--known-no-badge); }
+    .KNOWN_NO_BADGE .type-pill,
+    .COMPLIANCE_WARNING .type-pill {
+      background: rgba(255, 179, 0, 0.22);
+      color: #ffb300;
+      border: 1px solid rgba(255, 179, 0, 0.4);
+    }
 
     .alert-thumb {
-      width: 54px; height: 54px;
+      width: 58px; height: 58px;
       object-fit: cover;
       border-radius: 4px;
       flex-shrink: 0;
       background: #080e1a;
+      border: 1px solid var(--border);
     }
     .alert-thumb-ph {
-      width: 54px; height: 54px;
+      width: 58px; height: 58px;
       border-radius: 4px;
       background: var(--bg-panel);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 22px;
+      font-size: 24px;
       flex-shrink: 0;
+      border: 1px solid var(--border);
     }
 
     .alert-body  { flex: 1; min-width: 0; }
@@ -620,15 +642,74 @@
       padding: 1px 5px;
       border-radius: 3px;
       font-weight: 700;
+      letter-spacing: 0.04em;
     }
-    .CONFIRMED_UNKNOWN .type-pill { background: var(--unknown-dim); color: var(--unknown); }
-    .EVASIVE_ALERT .type-pill     { background: var(--evasive-dim); color: var(--evasive); }
+
+    .alert-msg {
+      font-size: 10.5px;
+      line-height: 1.45;
+      margin: 4px 0 6px 0;
+      color: #e2ecf9;
+      background: rgba(0, 0, 0, 0.35);
+      border-left: 2px solid var(--accent);
+      padding: 5px 8px;
+      border-radius: 0 4px 4px 0;
+      word-break: break-word;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .COMPLIANCE_WARNING .alert-msg,
+    .KNOWN_NO_BADGE .alert-msg {
+      border-left-color: #ffb300;
+    }
+    .INTRUDER_ALERT .alert-msg,
+    .CONFIRMED_UNKNOWN .alert-msg {
+      border-left-color: var(--unknown);
+    }
+
+    .alert-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px;
+      flex-wrap: wrap;
+    }
+    .btn-alert-copy,
+    .btn-alert-wa {
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 3px 8px;
+      border-radius: 4px;
+      text-decoration: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-mid);
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .btn-alert-copy:hover {
+      background: var(--accent-lo);
+      color: var(--text-hi);
+      border-color: var(--accent);
+    }
+    .btn-alert-wa {
+      border-color: rgba(37, 211, 102, 0.35);
+      background: rgba(37, 211, 102, 0.12);
+      color: #25d366;
+    }
+    .btn-alert-wa:hover {
+      background: rgba(37, 211, 102, 0.28);
+      border-color: #25d366;
+      color: #fff;
+    }
 
     .alert-meta {
       font-family: 'JetBrains Mono', monospace;
       font-size: 9px;
       color: var(--text-dim);
-      line-height: 1.7;
+      line-height: 1.6;
     }
 
     /* ================================================================
@@ -1347,11 +1428,49 @@ function exportCsvLog() {
 }
 
 // =========================================================================
-// Alert handler
+// Alert handler & Security Dispatcher Actions
 // =========================================================================
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function copyAlertText(btn, text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      const orig = btn.innerHTML;
+      btn.innerHTML = '✅ Copied!';
+      btn.style.color = '#00e676';
+      setTimeout(() => {
+        btn.innerHTML = orig;
+        btn.style.color = '';
+      }, 1800);
+    }).catch(() => fallbackCopy(btn, text));
+  } else {
+    fallbackCopy(btn, text);
+  }
+}
+
+function fallbackCopy(btn, text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  const orig = btn.innerHTML;
+  btn.innerHTML = '✅ Copied!';
+  setTimeout(() => { btn.innerHTML = orig; }, 1800);
+}
+
 function onAlert(msg) {
-  const isIntruder = msg.is_intruder !== false && (msg.status === 'CONFIRMED_UNKNOWN' || msg.status === 'EVASIVE_ALERT');
-  const isBadgeWarning = msg.status === 'KNOWN_NO_BADGE' || msg.type === 'badge_warning';
+  const isIntruder = msg.is_intruder !== false && (msg.status === 'CONFIRMED_UNKNOWN' || msg.status === 'EVASIVE_ALERT' || msg.alert_level === 'INTRUDER_ALERT');
+  const isBadgeWarning = msg.status === 'KNOWN_NO_BADGE' || msg.type === 'badge_warning' || msg.alert_level === 'COMPLIANCE_WARNING';
 
   if (isIntruder) {
     alertCount++;
@@ -1367,11 +1486,19 @@ function onAlert(msg) {
   const ts   = msg.timestamp_str || new Date(msg.timestamp * 1000)
                  .toLocaleTimeString('en-GB', { hour12: false });
 
-  const card = document.createElement('div');
-  card.className = `alert-card ${msg.status}`;
+  // Standardized official security message payload
+  const msgText = msg.message || (isIntruder
+    ? `🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #${msg.track_id}) detected without a college ID card at ${ts}. Action: Intercept and verify identity immediately.`
+    : `⚠️ COMPLIANCE ALERT [CAM-01]: Student ${msg.person_name || 'Authorized Student'} (Track #${msg.track_id}) entered without wearing an ID card at ${ts}. Action: Issue verbal reminder at gate.`
+  );
 
-  const icon = isIntruder ? '🚨' : (isBadgeWarning ? '🪪' : '⚠️');
-  const pillText = isIntruder ? 'INTRUDER' : (isBadgeWarning ? 'NO ID CARD' : 'EVASIVE');
+  const card = document.createElement('div');
+  const alertCls = isIntruder ? 'INTRUDER_ALERT' : 'COMPLIANCE_WARNING';
+  card.className = `alert-card ${alertCls} ${msg.status || ''}`;
+
+  const icon = isIntruder ? '🚨' : '🪪';
+  const pillText = isIntruder ? 'INTRUDER' : 'NO ID CARD';
+  const waUrl = `https://wa.me/?text=${encodeURIComponent(msgText)}`;
 
   card.innerHTML = `
     ${msg.snapshot_url
@@ -1384,9 +1511,13 @@ function onAlert(msg) {
         Track #${msg.track_id} ${msg.person_name ? '· ' + msg.person_name : ''}
         <span class="type-pill">${pillText}</span>
       </div>
+      <div class="alert-msg">${escapeHtml(msgText)}</div>
       <div class="alert-meta">
-        ${ts}<br>
-        ${isBadgeWarning ? 'Face verified, badge missing' : `S₁ ${msg.s1.toFixed(3)} · Z ${msg.z_score.toFixed(2)}`}
+        ${ts} · ${isBadgeWarning ? 'Face verified, badge missing' : `S₁ ${(msg.s1 || 0).toFixed(3)}`}
+      </div>
+      <div class="alert-actions">
+        <button class="btn-alert-copy" onclick="copyAlertText(this, ${JSON.stringify(msgText)})">📋 Copy Msg</button>
+        <a class="btn-alert-wa" href="${waUrl}" target="_blank" rel="noopener">📲 Forward to Security (WhatsApp)</a>
       </div>
     </div>`;
 
@@ -1405,10 +1536,10 @@ function onAlert(msg) {
 
     // Browser audio alarm + speech alert
     playAlarm(true);
-    speakAlert("Security Alert. Unknown person without ID card detected.");
+    speakAlert("Security Dispatch. Unidentified individual without ID card detected.");
   } else if (isBadgeWarning) {
     playAlarm(false);
-    speakAlert(`Attention ${msg.person_name || 'Student'}, please display your ID card.`);
+    speakAlert(`Compliance Alert. Student ${msg.person_name || ''} without ID card.`);
   }
 }
 
@@ -1622,9 +1753,12 @@ async function loadHistory() {
     list.reverse().forEach(a => onAlert({
       track_id:      a.track_id,
       status:        a.alert_type,
+      alert_level:   a.alert_type,
+      person_name:   a.top1_person,
       snapshot_url:  a.snapshot_url,
       timestamp:     a.timestamp,
       timestamp_str: a.timestamp_str,
+      message:       a.message,
       s1:            a.s1,
       z_score:       a.z_score,
     }));

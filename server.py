@@ -54,6 +54,7 @@ from vision_engine import (
     SNAPSHOT_DIR,
     ThreadedCamera,
     TrackStatus,
+    send_security_notification,
 )
 
 # ---------------------------------------------------------------------------
@@ -179,28 +180,34 @@ def _detect_alerts(persons: list) -> list:
         prev = _prev_statuses.get(p.track_id)
 
         if status_str in ("CONFIRMED_UNKNOWN", "EVASIVE_ALERT") and prev != status_str:
-            snaps = sorted(SNAPSHOT_DIR.glob(f"intruder_track{p.track_id}_*.jpg"))
+            snaps = sorted(SNAPSHOT_DIR.glob(f"intruder_track{p.track_id}_*.jpg")) or sorted(SNAPSHOT_DIR.glob(f"dispatch_track{p.track_id}_*.jpg"))
             snap_url = f"/snapshots/{snaps[-1].name}" if snaps else None
             ts = time.time()
+            t_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            msg_text = f"🚨 SECURITY DISPATCH [CAM-01]: Unidentified individual (Track #{p.track_id}) detected without a college ID card at {t_str}. Action: Intercept and verify identity immediately."
+            alert_lvl = "INTRUDER_ALERT"
             alerts.append({
                 "type":          "alert",
+                "alert_level":   alert_lvl,
                 "is_intruder":   True,
                 "track_id":      p.track_id,
                 "status":        status_str,
                 "person_name":   p.person_name or "Unknown Intruder",
                 "snapshot_url":  snap_url,
                 "timestamp":     ts,
-                "timestamp_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                "timestamp_str": t_str,
+                "message":       msg_text,
                 "s1":            round(float(p.s1), 3),
                 "z_score":       round(float(p.z_score), 2),
             })
+            send_security_notification(msg_text, snap_url)
             # Persist alert to database
             try:
                 conn = sqlite3.connect(str(DB_PATH))
                 conn.execute(
-                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (p.track_id, status_str, p.person_name or "Unknown", p.s1, p.z_score, snap_url or "", ts),
+                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (p.track_id, alert_lvl, p.person_name or "Unknown", p.s1, p.z_score, snap_url or "", ts, msg_text),
                 )
                 conn.commit()
                 conn.close()
@@ -208,25 +215,34 @@ def _detect_alerts(persons: list) -> list:
                 log.warning(f"Could not record alert: {e}")
 
         elif status_str == "KNOWN_NO_BADGE" and prev != status_str:
+            snaps = sorted(SNAPSHOT_DIR.glob(f"dispatch_track{p.track_id}_*.jpg"))
+            snap_url = f"/snapshots/{snaps[-1].name}" if snaps else None
             ts = time.time()
+            t_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            id_name = p.person_name or "Authorized Student"
+            msg_text = f"⚠️ COMPLIANCE ALERT [CAM-01]: Student {id_name} (Track #{p.track_id}) entered without wearing an ID card at {t_str}. Action: Issue verbal reminder at gate."
+            alert_lvl = "COMPLIANCE_WARNING"
             alerts.append({
                 "type":          "badge_warning",
+                "alert_level":   alert_lvl,
                 "is_intruder":   False,
                 "track_id":      p.track_id,
                 "status":        status_str,
-                "person_name":   p.person_name or "Authorized Person",
-                "snapshot_url":  None,
+                "person_name":   id_name,
+                "snapshot_url":  snap_url,
                 "timestamp":     ts,
-                "timestamp_str": time.strftime("%H:%M:%S", time.localtime(ts)),
+                "timestamp_str": t_str,
+                "message":       msg_text,
                 "s1":            round(float(p.s1), 3),
                 "z_score":       round(float(p.z_score), 2),
             })
+            send_security_notification(msg_text, snap_url)
             try:
                 conn = sqlite3.connect(str(DB_PATH))
                 conn.execute(
-                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (p.track_id, status_str, p.person_name or "Authorized Person", p.s1, p.z_score, "", ts),
+                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (p.track_id, alert_lvl, id_name, p.s1, p.z_score, snap_url or "", ts, msg_text),
                 )
                 conn.commit()
                 conn.close()
@@ -303,6 +319,22 @@ def processing_loop():
             with _latest_jpeg_lock:
                 _latest_annotated_jpeg = buf.tobytes()
             _new_jpeg_event.set()
+
+        # Emit any immediate new security dispatches from vision_engine
+        for d in getattr(res, "dispatches", []):
+            try:
+                conn = sqlite3.connect(str(DB_PATH))
+                conn.execute(
+                    "INSERT INTO alerts (track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (d["track_id"], d["alert_level"], d["person_name"], d.get("s1", 0.0), d.get("z_score", 0.0), d.get("snapshot_url", ""), d["timestamp"], d["message"]),
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                log.warning(f"Could not record dispatch alert: {e}")
+
+            manager.broadcast_from_thread(d)
 
         # Emit any immediate new alerts
         new_alerts = _detect_alerts(res.persons)
@@ -381,9 +413,13 @@ async def lifespan(app: FastAPI):
                     s1            REAL,
                     z_score       REAL,
                     snapshot_path TEXT,
-                    created_at    REAL
+                    created_at    REAL,
+                    message       TEXT
                 )
             """)
+            cols = [col[1] for col in conn.execute("PRAGMA table_info(alerts)").fetchall()]
+            if "message" not in cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN message TEXT")
             conn.commit()
             conn.close()
         except Exception as e:
@@ -580,7 +616,7 @@ async def api_alerts(limit: int = 50):
     try:
         conn = sqlite3.connect(str(DB_PATH))
         rows = conn.execute(
-            "SELECT track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at "
+            "SELECT track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message "
             "FROM alerts ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -595,6 +631,7 @@ async def api_alerts(limit: int = 50):
                 "snapshot_url":  r[5] if r[5] else None,
                 "timestamp":     r[6],
                 "timestamp_str": time.strftime("%H:%M:%S", time.localtime(r[6])),
+                "message":       r[7] if len(r) > 7 else None,
             }
             for r in rows
         ]
@@ -621,18 +658,20 @@ async def api_export_csv():
         "Cohort Z-Score",
         "Snapshot URL",
         "Timestamp",
+        "Security Message",
     ])
     if DB_PATH.exists():
         try:
             conn = sqlite3.connect(str(DB_PATH))
             rows = conn.execute(
-                "SELECT id, track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at "
+                "SELECT id, track_id, alert_type, top1_person, s1, z_score, snapshot_path, created_at, message "
                 "FROM alerts ORDER BY created_at DESC"
             ).fetchall()
             conn.close()
             for r in rows:
                 t_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r[7])) if r[7] else ""
-                writer.writerow([r[0], r[1], r[2], r[3], round(float(r[4] or 0), 4), round(float(r[5] or 0), 2), r[6], t_str])
+                msg_val = r[8] if len(r) > 8 and r[8] else ""
+                writer.writerow([r[0], r[1], r[2], r[3], round(float(r[4] or 0), 4), round(float(r[5] or 0), 2), r[6], t_str, msg_val])
         except Exception as e:
             log.warning(f"Export CSV read error: {e}")
 
